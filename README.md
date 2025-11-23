@@ -6,28 +6,45 @@ GitHub: https://github.com/matthew-fornear/pan
 
 ## Overview
 
-Pan provides a comprehensive platform for creating, editing, and mixing audio projects. Whether you're a professional producer or an aspiring musician, Pan offers the tools you need to bring your musical ideas to life.
+Pan provides a comprehensive platform for creating, editing, and mixing audio projects with a full-featured graphical interface. Whether you're a professional producer or an aspiring musician, Pan offers the tools you need to bring your musical ideas to life.
 
 ## Features
 
 ### Core Functionality
-- **Multi-track Recording**: Record and edit multiple audio tracks simultaneously
-- **MIDI Support**: Full MIDI sequencing and editing capabilities with synthesizer
-- **Waveform Types**: Sine, Square, Sawtooth, and Triangle waveforms
-- **Sustain Pedal**: Full sustain pedal support (CC 64)
-- **Audio Effects**: Built-in effects processing (reverb, delay, EQ, compression, etc.)
-- **Virtual Instruments**: Synthesizers with multiple waveforms
-- **Mixing Console**: Professional mixing interface with faders, panning, and sends
-- **Timeline Editing**: Precise audio and MIDI editing with waveform visualization
-- **Project Management**: Save, load, and export projects in various formats
+- **Full GUI Interface**: Complete graphical user interface built with ImGui and GLFW
+- **Multi-track Recording**: Record and edit multiple MIDI tracks simultaneously
+- **MIDI Support**: Full MIDI sequencing and editing with real-time input
+- **Piano Roll Editor**: Visual MIDI note editor with:
+  - Grid snapping (1/4, 1/8, 1/16, triplets, etc.)
+  - Draw tool for creating notes
+  - Note dragging and resizing
+  - Box selection
+  - Quantization
+- **Timeline View**: Visual timeline with beat markers and playhead
+- **Instrument Library**: Built-in instrument presets organized by category:
+  - **Synth**: Supersaw, Hollow Pad, Bell Lead, Deep Bass, Harsh Lead
+  - **Piano**: Bright Piano, Electric Piano, Dark Piano
+- **User Presets**: Save and load custom oscillator configurations
+- **Audio Effects**: 
+  - Reverb with adjustable parameters (Room Size, Damping, Wet/Dry, Width)
+  - Reverb presets (Room, Hall, Plate, Chamber, Cathedral, Spring, Custom)
+- **Multiple Oscillators**: Each track supports multiple oscillators with:
+  - Waveform types: Sine, Square, Sawtooth, Triangle
+  - Frequency multipliers
+  - Amplitude control
+- **Project Management**: Save and load projects in `.pan` format with file browser
+- **Transport Controls**: Play, pause, stop, record with BPM control
+- **Count-In**: 4-beat click before recording/playback
+- **Drag & Drop**: Intuitive drag-and-drop for instruments, waveforms, and effects
 
 ### Planned Features
+- Additional effects (Delay, Chorus, Distortion, etc.)
 - Plugin support (VST, AU, LV2)
 - Automation curves
+- Audio track recording (currently MIDI only)
 - Time-stretching and pitch-shifting
 - Spectral editing
 - Surround sound support
-- Collaboration features
 
 ## Installation
 
@@ -40,6 +57,12 @@ Pan provides a comprehensive platform for creating, editing, and mixing audio pr
   - Windows: Download from [portaudio.com](http://www.portaudio.com/)
 - **ALSA** (for MIDI input on Linux):
   - Ubuntu/Debian: `sudo apt-get install libasound2-dev`
+- **GLFW3** (for GUI windowing):
+  - Ubuntu/Debian: `sudo apt-get install libglfw3-dev libgl1-mesa-dev`
+  - macOS: `brew install glfw`
+  - Fedora/RHEL: `sudo dnf install glfw-devel mesa-libGL-devel`
+- **ImGui** (included as submodule or bundled)
+- **nanosvg** (for SVG icon rendering, included)
 
 ### Building from Source
 
@@ -52,108 +75,72 @@ make
 # Or on Windows: cmake --build . --config Release
 ```
 
-### Build Options
-
-- `BUILD_TESTS=ON/OFF`: Build the test suite (default: ON)
-- `BUILD_EXAMPLES=ON/OFF`: Build example projects (default: OFF)
-
-Example:
-```bash
-cmake -DBUILD_EXAMPLES=ON -DBUILD_TESTS=OFF ..
-make
-```
-
-### Running Tests
-
-After building:
-```bash
-cd build
-ctest
-# Or run directly:
-./pan_tests
-```
+The executable will be built as `build/pan`.
 
 ## Usage
 
-### Basic Usage
+### Running the Application
 
-Run the main application:
 ```bash
 cd build
 ./pan
 ```
 
-### Testing Audio Output
+### Basic Workflow
 
-Build and run the sine wave test example:
-```bash
-cd build
-cmake -DBUILD_EXAMPLES=ON ..
-make sine_wave_test
-./sine_wave_test
-```
+1. **Create a Track**: Click "+ Add Track" to create a new track
+2. **Load an Instrument**: 
+   - Drag an instrument from the Library (Synth or Piano categories)
+   - Or drag a basic waveform (Sine, Square, Sawtooth, Triangle)
+   - Drop onto a track header or the Components tab
+3. **Record MIDI**: 
+   - Arm a track (click the red/grey circle)
+   - Enable master record (red circle in transport)
+   - Click play to start recording
+   - Play notes on your MIDI keyboard
+4. **Edit Notes**: 
+   - Use the Piano Roll editor at the bottom
+   - Draw notes with the Draw tool (Ctrl+D or D key)
+   - Drag notes to move them
+   - Resize notes by dragging their edges
+   - Select multiple notes with box selection
+5. **Add Effects**: 
+   - Go to the Effects tab
+   - Click "+ Add Effect" → select Reverb
+   - Adjust parameters in the effect box
+6. **Save Your Project**: 
+   - File → Save (Ctrl+S) or Save As...
+   - Projects are saved as `.pan` files
 
-This will play a 440 Hz sine wave for 3 seconds to verify audio output is working.
+### Keyboard Shortcuts
 
-### MIDI Keyboard Test
+- **Ctrl+D** or **D**: Toggle draw tool in piano roll
+- **Ctrl+A**: Select all notes in piano roll
+- **Delete**: Delete selected notes
+- **Ctrl+S**: Save project
+- **Ctrl+O**: Open project
+- **Ctrl+N**: New project
+- **Q**: Quantize selected notes (when piano roll is active)
 
-Test with a MIDI keyboard:
-```bash
-cd build
-cmake -DBUILD_EXAMPLES=ON ..
-make midi_keyboard_test
-./midi_keyboard_test
-```
+### Piano Roll Features
 
-Connect your MIDI keyboard and play notes!
+- **Grid Snapping**: Right-click to change grid division (1/4, 1/8, 1/16, triplets, etc.)
+- **Draw Tool**: Click and drag to create notes of variable length
+- **Note Editing**: 
+  - Click and drag notes to move them
+  - Drag left/right edges to resize notes
+  - Box select multiple notes
+  - Drag multiple selected notes together
+- **Note Overlap**: Dragging a note over another automatically cuts the underlying note
+- **Quantization**: Right-click → "Quantize Notes" to snap notes to grid
 
-### Waveform Testing
+### Saving Presets
 
-Test different waveforms (terminal-based, no GUI needed):
-```bash
-cd build
-cmake -DBUILD_EXAMPLES=ON ..
-make waveform_test
-./waveform_test
-```
-
-Then use the menu:
-- Press `1` for Sine wave
-- Press `2` for Square wave
-- Press `3` for Sawtooth wave
-- Press `4` for Triangle wave
-- Press `q` to quit
-
-The waveform changes in real-time while you play your MIDI keyboard.
-
-### GUI Waveform Test (Optional)
-
-If you want a graphical interface, install GUI dependencies first:
-
-**Ubuntu/Debian:**
-```bash
-sudo apt-get install libglfw3-dev libgl1-mesa-dev
-```
-
-**macOS (with Homebrew):**
-```bash
-brew install glfw
-```
-
-**Fedora/RHEL:**
-```bash
-sudo dnf install glfw-devel mesa-libGL-devel
-```
-
-Then build and run:
-```bash
-cd build
-cmake .. -DBUILD_EXAMPLES=ON
-make waveform_gui_test
-./waveform_gui_test
-```
-
-The GUI provides radio buttons to select waveforms and a volume slider.
+1. Configure oscillators in the Components tab
+2. Click "Save Preset" next to "Track X Components:"
+3. Enter a name for your preset
+4. Your preset will appear in the "Presets" section of the Library
+5. Right-click a saved preset to delete it
 
 ## Architecture
 
@@ -164,19 +151,22 @@ Pan is built with a modular C++ architecture:
 - **Audio Engine** (`src/audio/`): Real-time audio processing engine
   - `AudioEngine`: Main audio processing coordinator
   - `AudioBuffer`: Multi-channel audio buffer management
-  - `AudioDevice`: Audio I/O device abstraction
+  - `Effect`: Base class for audio effects
+  - `Reverb`: Reverb effect implementation
 
 - **MIDI System** (`src/midi/`): MIDI input and synthesis
   - `MidiInput`: MIDI device input handling
   - `MidiMessage`: MIDI message representation
-  - `Synthesizer`: Multi-voice synthesizer with multiple waveforms
+  - `Synthesizer`: Multi-voice synthesizer with multiple oscillators
+  - `MidiClip`: MIDI clip storage and playback
 
-- **Track System** (`src/track/`): Track and clip management
-  - `Track`: Individual audio/MIDI track with effects and mixing
-  - `TrackManager`: Manages all tracks in a project
-
-- **Project Management** (`src/project/`): Project file operations
-  - `ProjectManager`: Handles project save/load operations
+- **GUI System** (`src/gui/`): Complete graphical interface
+  - `MainWindow`: Main application window and UI management
+  - Piano roll editor
+  - Timeline view
+  - Track management
+  - File browser
+  - Component and effect editors
 
 ### Project Structure
 
@@ -185,16 +175,13 @@ pan/
 ├── include/pan/          # Public headers
 │   ├── audio/           # Audio engine headers
 │   ├── midi/            # MIDI system headers
-│   ├── track/            # Track system headers
-│   └── project/         # Project management headers
+│   └── gui/             # GUI headers
 ├── src/                  # Implementation files
 │   ├── audio/           # Audio engine implementation
 │   ├── midi/            # MIDI implementation
-│   ├── track/            # Track system implementation
-│   ├── project/         # Project management implementation
+│   ├── gui/             # GUI implementation
 │   └── main.cpp         # Application entry point
-├── examples/             # Example programs
-├── tests/                # Unit tests
+├── svg/                  # SVG icons (draw, folder)
 ├── CMakeLists.txt       # Build configuration
 └── README.md            # This file
 ```
@@ -205,7 +192,8 @@ pan/
 - **Build System**: CMake
 - **Audio Backend**: PortAudio
 - **MIDI Backend**: ALSA (Linux)
-- **GUI**: ImGui + GLFW (optional)
+- **GUI**: ImGui + GLFW (required)
+- **SVG Rendering**: nanosvg
 
 ## Troubleshooting
 
@@ -248,27 +236,37 @@ ctl.!default {
 
 Then restart your audio session or reboot.
 
+### MIDI Device Not Found
+
+- Ensure your MIDI device is connected
+- Check ALSA MIDI device list: `aconnect -l`
+- The application will continue without MIDI if no device is found
+
 ### CMake Issues
 
 - **CMake not found**: Install CMake 3.14 or higher
 - **Compiler errors**: Ensure you have a C++17 compatible compiler
-- **Link errors**: Make sure all required audio libraries are installed
+- **Link errors**: Make sure all required libraries are installed (PortAudio, GLFW, OpenGL)
 
 ## Development Roadmap
 
 - [x] Core audio engine structure
 - [x] Audio buffer management
-- [x] Track system architecture
-- [x] Project management framework
-- [x] Audio backend integration (PortAudio)
-- [x] Real-time audio I/O and routing
 - [x] MIDI input support
-- [x] Synthesizer with multiple waveforms
-- [x] Sustain pedal support
-- [ ] User interface (GUI framework)
-- [ ] Effects processing system
-- [ ] Virtual instruments
-- [ ] Project file format (save/load)
+- [x] Synthesizer with multiple waveforms and oscillators
+- [x] Full GUI interface with ImGui
+- [x] Piano roll editor with drawing and editing
+- [x] Timeline view with MIDI clip playback
+- [x] Track system with drag-and-drop
+- [x] Instrument library with presets
+- [x] User preset saving and loading
+- [x] Effects system (Reverb implemented)
+- [x] Project file format (save/load)
+- [x] File browser for project management
+- [ ] Additional effects (Delay, Chorus, Distortion)
+- [ ] Audio track recording
+- [ ] Automation curves
+- [ ] Plugin support (VST, AU, LV2)
 - [ ] Audio export functionality
 
 ## Contributing
@@ -289,7 +287,9 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 - PortAudio for cross-platform audio I/O
 - ALSA for MIDI support on Linux
-- ImGui for the GUI framework (optional)
+- ImGui for the GUI framework
+- GLFW for window management
+- nanosvg for SVG rendering
 
 ## Contact
 

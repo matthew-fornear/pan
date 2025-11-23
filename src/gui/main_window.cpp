@@ -113,6 +113,7 @@ MainWindow::MainWindow()
     , showContextMenu_(false)
     , pianoRollCenterNote_(60)  // C4
     , pianoRollAutoPositioned_(false)
+    , effectsScrollY_(0.0f)
     , folderIconTexture_(nullptr)
     , drawIconTexture_(nullptr)
     , folderIconWidth_(0)
@@ -389,6 +390,12 @@ bool MainWindow::initialize() {
     
     // Load SVG icons after OpenGL context is created
     loadSVGIcons();
+    
+    // Initialize instrument presets
+    initializeInstrumentPresets();
+    
+    // Load user-saved presets
+    loadUserPresets();
     
     // Initialize audio and MIDI
     if (!initializeAudio()) {
@@ -835,6 +842,7 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
     ImGui::Separator();
     ImGui::Spacing();
     
+    // Basic Waves section
     if (ImGui::CollapsingHeader("Basic Waves", ImGuiTreeNodeFlags_DefaultOpen)) {
         const char* waveNames[] = { "Sine", "Square", "Sawtooth", "Triangle" };
         Waveform waveforms[] = { 
@@ -860,6 +868,79 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
             }
             
             ImGui::PopID();
+        }
+    }
+    
+    // Instruments section with sub-categories
+    if (ImGui::CollapsingHeader("Instruments", ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Group instruments by category
+        std::map<std::string, std::vector<size_t>> categoryMap;
+        for (size_t i = 0; i < instrumentPresets_.size(); ++i) {
+            categoryMap[instrumentPresets_[i].category].push_back(i);
+        }
+        
+        // Render each category
+        for (const auto& [category, indices] : categoryMap) {
+            if (ImGui::TreeNode(category.c_str())) {
+                for (size_t idx : indices) {
+                    const auto& preset = instrumentPresets_[idx];
+                    ImGui::PushID(static_cast<int>(idx + 1000));  // Offset to avoid collision with waveforms
+                    
+                    // Make instrument preset draggable
+                    if (ImGui::Button(preset.name.c_str(), ImVec2(-1, 0))) {
+                        // Click to select
+                    }
+                    
+                    // Setup drag source
+                    if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                        ImGui::SetDragDropPayload("INSTRUMENT", &idx, sizeof(size_t));
+                        ImGui::Text("Dragging %s", preset.name.c_str());
+                        ImGui::EndDragDropSource();
+                    }
+                    
+                    ImGui::PopID();
+                }
+                ImGui::TreePop();
+            }
+        }
+    }
+    
+    // User Presets section
+    if (ImGui::CollapsingHeader("Presets", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (userPresets_.empty()) {
+            ImGui::TextDisabled("No saved presets");
+        } else {
+            for (size_t i = 0; i < userPresets_.size(); ++i) {
+                const auto& preset = userPresets_[i];
+                ImGui::PushID(static_cast<int>(i + 5000));  // Offset to avoid collision
+                
+                // Make user preset draggable
+                if (ImGui::Button(preset.name.c_str(), ImVec2(-1, 0))) {
+                    // Click to select
+                }
+                
+                // Right-click context menu for deletion
+                if (ImGui::BeginPopupContextItem()) {
+                    if (ImGui::MenuItem("Delete")) {
+                        userPresets_.erase(userPresets_.begin() + i);
+                        saveUserPresetsToFile();
+                        markDirty();
+                        ImGui::EndPopup();
+                        ImGui::PopID();
+                        break;  // Exit loop since we modified the vector
+                    }
+                    ImGui::EndPopup();
+                }
+                
+                // Setup drag source
+                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                    ImGui::SetDragDropPayload("USER_PRESET", &i, sizeof(size_t));
+                    ImGui::Text("Dragging %s", preset.name.c_str());
+                    ImGui::EndDragDropSource();
+                }
+                
+                ImGui::PopID();
+            }
         }
     }
     
@@ -894,6 +975,37 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                 char trackLabel[64];
                 snprintf(trackLabel, sizeof(trackLabel), "Track %zu Components:", selectedTrackIndex_ + 1);
                 ImGui::Text("%s", trackLabel);
+                
+                // "Save Preset" button next to label
+                ImGui::SameLine();
+                if (ImGui::Button("Save Preset", ImVec2(100, 0))) {
+                    // Open dialog to name the preset
+                    ImGui::OpenPopup("SavePresetDialog");
+                }
+                
+                // Save preset dialog
+                if (ImGui::BeginPopupModal("SavePresetDialog", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                    static char presetName[64] = "";
+                    ImGui::Text("Enter preset name:");
+                    ImGui::InputText("##presetname", presetName, sizeof(presetName));
+                    ImGui::Spacing();
+                    
+                    if (ImGui::Button("Save", ImVec2(120, 0))) {
+                        if (strlen(presetName) > 0) {
+                            saveUserPreset(presetName, tracks_[selectedTrackIndex_].oscillators);
+                            presetName[0] = '\0';  // Clear input
+                            ImGui::CloseCurrentPopup();
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                        presetName[0] = '\0';  // Clear input
+                        ImGui::CloseCurrentPopup();
+                    }
+                    
+                    ImGui::EndPopup();
+                }
+                
                 ImGui::Separator();
                 ImGui::Spacing();
                 
@@ -913,6 +1025,7 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
             
             // Drop target for the entire components area
             if (ImGui::BeginDragDropTarget()) {
+                // Accept single waveform
                 if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("WAVEFORM")) {
                     if (payload->DataSize == sizeof(Waveform)) {
                         Waveform droppedWave = *(Waveform*)payload->Data;
@@ -920,7 +1033,44 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                         if (!tracks_.empty() && selectedTrackIndex_ < tracks_.size()) {
                             tracks_[selectedTrackIndex_].oscillators.push_back(Oscillator(droppedWave, 1.0f, 0.5f));
                             tracks_[selectedTrackIndex_].synth->setOscillators(tracks_[selectedTrackIndex_].oscillators);
+                            
+                            // Set instrument name based on waveform
+                            const char* waveNames[] = { "Sine", "Square", "Sawtooth", "Triangle" };
+                            tracks_[selectedTrackIndex_].instrumentName = waveNames[static_cast<int>(droppedWave)];
+                            
                             markDirty();
+                        }
+                    }
+                }
+                // Accept instrument preset
+                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("INSTRUMENT")) {
+                    if (payload->DataSize == sizeof(size_t)) {
+                        size_t presetIndex = *(size_t*)payload->Data;
+                        if (presetIndex < instrumentPresets_.size() && !tracks_.empty() && selectedTrackIndex_ < tracks_.size()) {
+                            const auto& preset = instrumentPresets_[presetIndex];
+                            // Replace all oscillators with the preset's oscillators
+                            tracks_[selectedTrackIndex_].oscillators = preset.oscillators;
+                            tracks_[selectedTrackIndex_].synth->setOscillators(tracks_[selectedTrackIndex_].oscillators);
+                            tracks_[selectedTrackIndex_].waveformSet = true;
+                            tracks_[selectedTrackIndex_].instrumentName = preset.name;
+                            markDirty();
+                            std::cout << "Loaded preset '" << preset.name << "' onto selected track" << std::endl;
+                        }
+                    }
+                }
+                // Accept user preset
+                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("USER_PRESET")) {
+                    if (payload->DataSize == sizeof(size_t)) {
+                        size_t presetIndex = *(size_t*)payload->Data;
+                        if (presetIndex < userPresets_.size() && !tracks_.empty() && selectedTrackIndex_ < tracks_.size()) {
+                            const auto& preset = userPresets_[presetIndex];
+                            // Replace all oscillators with the preset's oscillators
+                            tracks_[selectedTrackIndex_].oscillators = preset.oscillators;
+                            tracks_[selectedTrackIndex_].synth->setOscillators(tracks_[selectedTrackIndex_].oscillators);
+                            tracks_[selectedTrackIndex_].waveformSet = true;
+                            tracks_[selectedTrackIndex_].instrumentName = preset.name;
+                            markDirty();
+                            std::cout << "Loaded user preset '" << preset.name << "' onto selected track" << std::endl;
                         }
                     }
                 }
@@ -945,17 +1095,36 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                 ImGui::Separator();
                 ImGui::Spacing();
                 
-                // "Add Effect" button
-                if (ImGui::Button("+ Add Reverb", ImVec2(150, 30))) {
-                    // Add reverb effect to selected track
-                    auto reverb = std::make_shared<Reverb>(engine_ ? engine_->getSampleRate() : 44100.0);
-                    tracks_[selectedTrackIndex_].effects.push_back(reverb);
-                    markDirty();
+                // "Add Effect" dropdown button
+                if (ImGui::Button("+ Add Effect", ImVec2(150, 30))) {
+                    ImGui::OpenPopup("AddEffectPopup");
+                }
+                
+                if (ImGui::BeginPopup("AddEffectPopup")) {
+                    if (ImGui::MenuItem("Reverb")) {
+                        auto reverb = std::make_shared<Reverb>(engine_ ? engine_->getSampleRate() : 44100.0);
+                        tracks_[selectedTrackIndex_].effects.push_back(reverb);
+                        markDirty();
+                        // Auto-scroll to show the new effect
+                        effectsScrollY_ = 9999.0f;  // Scroll to bottom
+                    }
+                    // TODO: Add more effects here (Delay, Chorus, Distortion, etc.)
+                    ImGui::EndPopup();
                 }
                 
                 ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::Spacing();
+                
+                // Create scrollable child window for effects
+                ImVec2 effectsRegion = ImGui::GetContentRegionAvail();
+                ImGui::BeginChild("EffectsScrollRegion", ImVec2(effectsRegion.x, effectsRegion.y), false);
+                
+                // Set scroll position if we just added an effect
+                if (effectsScrollY_ > 0.0f) {
+                    ImGui::SetScrollY(effectsScrollY_);
+                    effectsScrollY_ = 0.0f;  // Reset after applying
+                }
                 
                 // Render effect boxes from selected track
                 auto& effects = tracks_[selectedTrackIndex_].effects;
@@ -965,6 +1134,8 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                     ImGui::PopID();
                     ImGui::SameLine();
                 }
+                
+                ImGui::EndChild();
             } else {
                 ImGui::Text("No tracks available");
             }
@@ -1262,14 +1433,23 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
         float totalWidth = textSize.x + spacing + buttonWidth;
         ImVec2 headerCenter = ImVec2(headerStartPos.x + columnWidth / 2.0f, headerStartPos.y + headerHeight / 2.0f);
         
-        // Track label - centered
+        // Track label - centered at top
         char trackLabel[32];
         snprintf(trackLabel, sizeof(trackLabel), "Track %zu", i + 1);
-        ImVec2 textPos = ImVec2(headerCenter.x - totalWidth / 2.0f, headerCenter.y - textSize.y / 2.0f);
+        float trackLabelOffset = tracks_[i].instrumentName.empty() ? 0.0f : -10.0f;  // Move up if instrument name present
+        ImVec2 textPos = ImVec2(headerCenter.x - totalWidth / 2.0f, headerCenter.y - textSize.y / 2.0f + trackLabelOffset);
         drawList->AddText(textPos, IM_COL32(250, 250, 240, 255), trackLabel);
         
+        // Instrument name - below track label (if set)
+        if (!tracks_[i].instrumentName.empty()) {
+            ImVec2 instTextSize = ImGui::CalcTextSize(tracks_[i].instrumentName.c_str());
+            ImVec2 instTextPos = ImVec2(headerCenter.x - instTextSize.x / 2.0f, headerCenter.y + textSize.y / 2.0f + 2.0f);
+            // Draw in slightly dimmer color
+            drawList->AddText(instTextPos, IM_COL32(180, 180, 170, 255), tracks_[i].instrumentName.c_str());
+        }
+        
         // Hot button - grey/red circle
-        ImVec2 buttonPos = ImVec2(textPos.x + textSize.x + spacing, headerCenter.y - 15.0f);
+        ImVec2 buttonPos = ImVec2(textPos.x + textSize.x + spacing, headerCenter.y - 15.0f + trackLabelOffset);
         ImVec2 buttonRectMin = ImVec2(buttonPos.x - 2, buttonPos.y - 2);
         ImVec2 buttonRectMax = ImVec2(buttonPos.x + 32, buttonPos.y + 32);
         
@@ -1342,8 +1522,9 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
             }
         }
         
-        // Drop target for waveforms
+        // Drop target for waveforms and instruments
         if (ImGui::BeginDragDropTarget()) {
+            // Accept single waveform
             if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("WAVEFORM")) {
                 if (payload->DataSize == sizeof(Waveform)) {
                     Waveform droppedWave = *(Waveform*)payload->Data;
@@ -1351,9 +1532,50 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
                     oscillators.push_back(Oscillator(droppedWave, 1.0f, 0.5f));
                     tracks_[i].synth->setOscillators(oscillators);
                     tracks_[i].waveformSet = true;
+                    
+                    // Set instrument name based on waveform
+                    const char* waveNames[] = { "Sine", "Square", "Sawtooth", "Triangle" };
+                    tracks_[i].instrumentName = waveNames[static_cast<int>(droppedWave)];
+                    
                     // Select this track when a sample is dropped on it
                     selectedTrackIndex_ = i;
                     markDirty();
+                }
+            }
+            // Accept instrument preset
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("INSTRUMENT")) {
+                if (payload->DataSize == sizeof(size_t)) {
+                    size_t presetIndex = *(size_t*)payload->Data;
+                    if (presetIndex < instrumentPresets_.size()) {
+                        const auto& preset = instrumentPresets_[presetIndex];
+                        // Replace all oscillators with the preset's oscillators
+                        tracks_[i].oscillators = preset.oscillators;
+                        tracks_[i].synth->setOscillators(tracks_[i].oscillators);
+                        tracks_[i].waveformSet = true;
+                        tracks_[i].instrumentName = preset.name;
+                        // Select this track
+                        selectedTrackIndex_ = i;
+                        markDirty();
+                        std::cout << "Loaded preset '" << preset.name << "' onto track " << i << std::endl;
+                    }
+                }
+            }
+            // Accept user preset
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("USER_PRESET")) {
+                if (payload->DataSize == sizeof(size_t)) {
+                    size_t presetIndex = *(size_t*)payload->Data;
+                    if (presetIndex < userPresets_.size()) {
+                        const auto& preset = userPresets_[presetIndex];
+                        // Replace all oscillators with the preset's oscillators
+                        tracks_[i].oscillators = preset.oscillators;
+                        tracks_[i].synth->setOscillators(tracks_[i].oscillators);
+                        tracks_[i].waveformSet = true;
+                        tracks_[i].instrumentName = preset.name;
+                        // Select this track
+                        selectedTrackIndex_ = i;
+                        markDirty();
+                        std::cout << "Loaded user preset '" << preset.name << "' onto track " << i << std::endl;
+                    }
                 }
             }
             ImGui::EndDragDropTarget();
@@ -3775,6 +3997,201 @@ void MainWindow::loadSVGIcons() {
         std::cerr << "Warning: Failed to load draw icon" << std::endl;
     }
 #endif
+}
+
+void MainWindow::initializeInstrumentPresets() {
+    // Clear any existing presets
+    instrumentPresets_.clear();
+    
+    // === SYNTH CATEGORY ===
+    
+    // Supersaw - Multiple detuned sawtooth oscillators (subtractive)
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Supersaw",
+        "Synth",
+        {
+            Oscillator(Waveform::Sawtooth, 1.0f, 0.4f),
+            Oscillator(Waveform::Sawtooth, 0.995f, 0.3f),
+            Oscillator(Waveform::Sawtooth, 1.005f, 0.3f),
+            Oscillator(Waveform::Sawtooth, 0.99f, 0.2f),
+            Oscillator(Waveform::Sawtooth, 1.01f, 0.2f)
+        }
+    ));
+    
+    // Hollow Pad - Odd harmonics only (subtractive filtering)
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Hollow Pad",
+        "Synth",
+        {
+            Oscillator(Waveform::Square, 1.0f, 0.6f),        // Square has odd harmonics
+            Oscillator(Waveform::Sine, 3.0f, 0.2f),          // 3rd harmonic
+            Oscillator(Waveform::Sine, 5.0f, 0.12f),         // 5th harmonic
+            Oscillator(Waveform::Sine, 7.0f, 0.08f)          // 7th harmonic (very weak)
+        }
+    ));
+    
+    // Ring Mod Lead - Inharmonic bell-like (multiplicative/ring modulation)
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Bell Lead",
+        "Synth",
+        {
+            Oscillator(Waveform::Sine, 1.0f, 0.5f),          // Fundamental
+            Oscillator(Waveform::Sine, 2.76f, 0.3f),         // Inharmonic ratio
+            Oscillator(Waveform::Sine, 5.4f, 0.2f),          // Metallic overtone
+            Oscillator(Waveform::Triangle, 8.93f, 0.12f)     // Bell-like shimmer
+        }
+    ));
+    
+    // Deep Bass - Sub-octave heavy (divisive/sub-oscillator)
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Deep Bass",
+        "Synth",
+        {
+            Oscillator(Waveform::Sine, 0.5f, 0.7f),          // Sub-octave
+            Oscillator(Waveform::Triangle, 1.0f, 0.5f),      // Fundamental
+            Oscillator(Waveform::Square, 1.0f, 0.25f),       // Add harmonics
+            Oscillator(Waveform::Sine, 0.25f, 0.15f)         // Two octaves down (sub-sub)
+        }
+    ));
+    
+    // Harsh Lead - Complex ratios (multiplicative/FM-style)
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Harsh Lead",
+        "Synth",
+        {
+            Oscillator(Waveform::Sawtooth, 1.0f, 0.55f),     // Carrier
+            Oscillator(Waveform::Square, 1.618f, 0.4f),      // Golden ratio (FM)
+            Oscillator(Waveform::Square, 2.333f, 0.3f),      // 7/3 ratio
+            Oscillator(Waveform::Sawtooth, 4.0f, 0.15f)      // Brightness
+        }
+    ));
+    
+    // === PIANO CATEGORY ===
+    
+    // Bright Piano - Harmonic series (additive)
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Bright Piano",
+        "Piano",
+        {
+            Oscillator(Waveform::Triangle, 1.0f, 0.5f),
+            Oscillator(Waveform::Sine, 2.0f, 0.3f),
+            Oscillator(Waveform::Sine, 3.0f, 0.15f),
+            Oscillator(Waveform::Sine, 4.0f, 0.1f),
+            Oscillator(Waveform::Sine, 5.0f, 0.05f)
+        }
+    ));
+    
+    // Electric Piano - Inharmonic (multiplicative/FM-style)
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Electric Piano",
+        "Piano",
+        {
+            Oscillator(Waveform::Sine, 1.0f, 0.6f),          // Carrier
+            Oscillator(Waveform::Sine, 1.414f, 0.3f),        // Inharmonic (sqrt(2))
+            Oscillator(Waveform::Triangle, 2.0f, 0.2f),      // Even harmonic
+            Oscillator(Waveform::Sine, 3.732f, 0.15f)        // More inharmonicity
+        }
+    ));
+    
+    // Dark Piano - Lower harmonics (subtractive)
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Dark Piano",
+        "Piano",
+        {
+            Oscillator(Waveform::Sine, 1.0f, 0.8f),          // Strong fundamental
+            Oscillator(Waveform::Triangle, 1.0f, 0.3f),      // Warmth
+            Oscillator(Waveform::Sine, 2.0f, 0.2f),          // 2nd harmonic only
+            Oscillator(Waveform::Sine, 0.5f, 0.15f)          // Sub-octave for depth
+        }
+    ));
+    
+    std::cout << "Initialized " << instrumentPresets_.size() << " instrument presets" << std::endl;
+}
+
+void MainWindow::saveUserPreset(const std::string& name, const std::vector<Oscillator>& oscillators) {
+    // Add to user presets
+    userPresets_.push_back(InstrumentPreset(name, "User", oscillators));
+    
+    // Save to file
+    saveUserPresetsToFile();
+    
+    std::cout << "Saved user preset: " << name << std::endl;
+}
+
+void MainWindow::loadUserPresets() {
+    userPresets_.clear();
+    
+    // Try to load from file
+    std::ifstream file("user_presets.pan");
+    if (!file.is_open()) {
+        std::cout << "No user presets file found (this is normal on first run)" << std::endl;
+        return;
+    }
+    
+    try {
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.empty()) continue;
+            
+            // Format: name|numOscillators
+            size_t pipePos = line.find('|');
+            if (pipePos == std::string::npos) continue;
+            
+            std::string name = line.substr(0, pipePos);
+            int numOscs = std::stoi(line.substr(pipePos + 1));
+            
+            std::vector<Oscillator> oscillators;
+            for (int i = 0; i < numOscs; ++i) {
+                if (!std::getline(file, line)) break;
+                
+                // Format: waveform,freqMult,amplitude
+                std::istringstream oscStream(line);
+                std::string waveStr, freqStr, ampStr;
+                
+                std::getline(oscStream, waveStr, ',');
+                std::getline(oscStream, freqStr, ',');
+                std::getline(oscStream, ampStr);
+                
+                Waveform wave = static_cast<Waveform>(std::stoi(waveStr));
+                float freq = std::stof(freqStr);
+                float amp = std::stof(ampStr);
+                
+                oscillators.push_back(Oscillator(wave, freq, amp));
+            }
+            
+            userPresets_.push_back(InstrumentPreset(name, "User", oscillators));
+        }
+        
+        std::cout << "Loaded " << userPresets_.size() << " user presets" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error loading user presets: " << e.what() << std::endl;
+        userPresets_.clear();
+    }
+    
+    file.close();
+}
+
+void MainWindow::saveUserPresetsToFile() {
+    std::ofstream file("user_presets.pan");
+    if (!file.is_open()) {
+        std::cerr << "Failed to save user presets file" << std::endl;
+        return;
+    }
+    
+    for (const auto& preset : userPresets_) {
+        // Write preset name and oscillator count
+        file << preset.name << "|" << preset.oscillators.size() << "\n";
+        
+        // Write each oscillator
+        for (const auto& osc : preset.oscillators) {
+            file << static_cast<int>(osc.waveform) << ","
+                 << osc.frequencyMultiplier << ","
+                 << osc.amplitude << "\n";
+        }
+    }
+    
+    file.close();
+    std::cout << "Saved " << userPresets_.size() << " user presets to file" << std::endl;
 }
 
 } // namespace pan

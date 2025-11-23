@@ -22,6 +22,7 @@ struct Track {
     std::shared_ptr<Synthesizer> synth;
     std::string name;
     bool waveformSet;  // Track if waveform has been explicitly set via drag-and-drop (deprecated, kept for compatibility)
+    std::string instrumentName;  // Name of loaded instrument or wave (e.g., "Supersaw", "Sine")
     
     // Effects chain
     std::vector<std::shared_ptr<Effect>> effects;  // Audio effects applied to this track
@@ -39,6 +40,16 @@ struct Track {
     Track();
     void addWaveformSample(float sample);  // Add sample to circular buffer (called from audio thread)
     std::vector<float> getWaveformSamples() const;  // Get current waveform for display (called from GUI thread)
+};
+
+// Instrument preset definition
+struct InstrumentPreset {
+    std::string name;
+    std::string category;  // e.g., "Synth", "Piano"
+    std::vector<Oscillator> oscillators;  // Oscillator configuration
+    
+    InstrumentPreset(const std::string& n, const std::string& cat, const std::vector<Oscillator>& oscs)
+        : name(n), category(cat), oscillators(oscs) {}
 };
 
 class MainWindow {
@@ -76,6 +87,15 @@ private:
     std::vector<std::pair<std::string, std::string>> commonDirectories_;  // Common dirs (name, path)
     void updateFileBrowser(const std::string& path);  // Update file browser contents
     void initializeCommonDirectories();  // Setup common directory shortcuts
+    
+    // Instrument library
+    std::vector<InstrumentPreset> instrumentPresets_;  // Preset instruments
+    std::vector<InstrumentPreset> userPresets_;  // User-saved presets
+    void initializeInstrumentPresets();  // Setup instrument presets
+    void saveUserPreset(const std::string& name, const std::vector<Oscillator>& oscillators);
+    void loadUserPresets();  // Load user presets from file
+    void saveUserPresetsToFile();  // Save user presets to file
+    float effectsScrollY_;  // Scroll position for effects panel
     
     // SVG icon textures
     void* folderIconTexture_;  // OpenGL texture for folder icon
