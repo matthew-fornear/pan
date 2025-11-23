@@ -1,0 +1,87 @@
+# Build directories
+build/
+cmake-build-*/
+cmake-build/
+out/
+bin/
+lib/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_dashsize.txt
+*.cmake
+!CMakeLists.txt
+Makefile
+*.ninja
+*.ninja.d
+
+# Compiled files
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+
+# Dependencies (FetchContent downloads here)
+_deps/
+third_party/
+deps/
+external/
+
+# Project files
+*.pan
+*.panproj
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.cache
+
+# OS-specific files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.AppleDouble
+.LSOverride
+
+# Editor backup files
+*~
+.#*
+\#*#
+.*.swp
+.*.swo
+.cache/
+
+# Test outputs
+Testing/
+*.gcov
+*.gcda
+*.gcno
+

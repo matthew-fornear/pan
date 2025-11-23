@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Pan DAW
+Comment=Digital Audio Workstation
+Exec=/home/user/projects/pan/build/pan
+Icon=/home/user/projects/pan/betaicon.png
+Terminal=false
+Categories=Audio;AudioVideo;
+StartupNotify=true
+
