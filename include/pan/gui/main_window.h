@@ -19,10 +19,16 @@ namespace pan {
 struct Track {
     std::vector<Oscillator> oscillators;  // Multiple oscillators per track
     bool isRecording;
+    bool isSolo;      // Solo button state
+    bool isMuted;     // Mute button state
     std::shared_ptr<Synthesizer> synth;
     std::string name;
     bool waveformSet;  // Track if waveform has been explicitly set via drag-and-drop (deprecated, kept for compatibility)
     std::string instrumentName;  // Name of loaded instrument or wave (e.g., "Supersaw", "Sine")
+    int colorIndex;   // Index into track color palette (0-15)
+    float peakLevel;  // Current peak level for metering (0.0 - 1.0)
+    float peakHold;   // Peak hold value for meter
+    double peakHoldTime;  // Time when peak was set
     
     // Effects chain
     std::vector<std::shared_ptr<Effect>> effects;  // Audio effects applied to this track
@@ -96,6 +102,13 @@ private:
     void loadUserPresets();  // Load user presets from file
     void saveUserPresetsToFile();  // Save user presets to file
     float effectsScrollY_;  // Scroll position for effects panel
+    
+    // Master output metering
+    float masterPeakL_;      // Left channel peak level
+    float masterPeakR_;      // Right channel peak level
+    float masterPeakHoldL_;  // Left channel peak hold
+    float masterPeakHoldR_;  // Right channel peak hold
+    double masterPeakHoldTime_;  // Time of last peak hold
     
     // SVG icon textures
     void* folderIconTexture_;  // OpenGL texture for folder icon

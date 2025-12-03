@@ -44,8 +44,14 @@ namespace pan {
 
 Track::Track() 
     : isRecording(false)
+    , isSolo(false)
+    , isMuted(false)
     , name("")
     , waveformSet(false)
+    , colorIndex(0)
+    , peakLevel(0.0f)
+    , peakHold(0.0f)
+    , peakHoldTime(0.0)
     , waveformBuffer(WAVEFORM_BUFFER_SIZE, 0.0f)
     , waveformBufferWritePos(0)
     , waveformBufferMutex(std::make_unique<std::mutex>())
@@ -114,6 +120,11 @@ MainWindow::MainWindow()
     , pianoRollCenterNote_(60)  // C4
     , pianoRollAutoPositioned_(false)
     , effectsScrollY_(0.0f)
+    , masterPeakL_(0.0f)
+    , masterPeakR_(0.0f)
+    , masterPeakHoldL_(0.0f)
+    , masterPeakHoldR_(0.0f)
+    , masterPeakHoldTime_(0.0)
     , folderIconTexture_(nullptr)
     , drawIconTexture_(nullptr)
     , folderIconWidth_(0)
@@ -306,83 +317,107 @@ bool MainWindow::initialize() {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     
-    // Setup Dear ImGui style with custom colors: slate grey, light grey, and ivory
+    // Setup Dear ImGui style - Ableton Live inspired dark theme
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
     
-    // Color definitions
-    ImVec4 slateGrey(0.18f, 0.20f, 0.22f, 1.0f);      // #2E3338 - dark slate grey
-    ImVec4 lightGrey(0.35f, 0.37f, 0.39f, 1.0f);       // #595E63 - light grey
-    ImVec4 ivory(0.98f, 0.98f, 0.94f, 1.0f);          // #FAFAF0 - ivory (for text)
-    ImVec4 darkSlate(0.12f, 0.14f, 0.16f, 1.0f);      // #1F2326 - darker slate for backgrounds
+    // Ableton-inspired color palette
+    ImVec4 bgDarkest(0.071f, 0.071f, 0.071f, 1.0f);    // #121212 - Darkest background
+    ImVec4 bgDark(0.098f, 0.098f, 0.098f, 1.0f);       // #191919 - Dark background
+    ImVec4 bgMid(0.137f, 0.137f, 0.137f, 1.0f);        // #232323 - Mid background
+    ImVec4 bgLight(0.180f, 0.180f, 0.180f, 1.0f);      // #2E2E2E - Light background
+    ImVec4 borderColor(0.220f, 0.220f, 0.220f, 1.0f);  // #383838 - Borders
+    ImVec4 textPrimary(0.878f, 0.878f, 0.878f, 1.0f);  // #E0E0E0 - Primary text
+    ImVec4 textSecondary(0.600f, 0.600f, 0.600f, 1.0f);// #999999 - Secondary text
+    ImVec4 accentOrange(1.0f, 0.584f, 0.0f, 1.0f);     // #FF9500 - Ableton orange (armed/record)
+    ImVec4 accentBlue(0.200f, 0.600f, 0.859f, 1.0f);   // #3399DB - Clip/selection blue
+    ImVec4 accentGreen(0.518f, 0.839f, 0.310f, 1.0f);  // #84D64F - Play/active green
+    ImVec4 mutedYellow(0.690f, 0.569f, 0.180f, 1.0f);  // #B0912E - Solo yellow
+    
+    // Style adjustments for cleaner look
+    style.WindowRounding = 0.0f;
+    style.FrameRounding = 2.0f;
+    style.GrabRounding = 2.0f;
+    style.TabRounding = 0.0f;
+    style.ScrollbarRounding = 0.0f;
+    style.WindowBorderSize = 1.0f;
+    style.FrameBorderSize = 0.0f;
+    style.PopupBorderSize = 1.0f;
+    style.FramePadding = ImVec2(8.0f, 4.0f);
+    style.ItemSpacing = ImVec2(8.0f, 4.0f);
+    style.ItemInnerSpacing = ImVec2(4.0f, 4.0f);
+    style.ScrollbarSize = 12.0f;
+    style.GrabMinSize = 8.0f;
     
     // Window colors
-    style.Colors[ImGuiCol_WindowBg] = slateGrey;
-    style.Colors[ImGuiCol_ChildBg] = darkSlate;
-    style.Colors[ImGuiCol_PopupBg] = slateGrey;
-    style.Colors[ImGuiCol_Border] = lightGrey;
+    style.Colors[ImGuiCol_WindowBg] = bgDark;
+    style.Colors[ImGuiCol_ChildBg] = bgDarkest;
+    style.Colors[ImGuiCol_PopupBg] = bgMid;
+    style.Colors[ImGuiCol_Border] = borderColor;
     style.Colors[ImGuiCol_BorderShadow] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
     
-    // Text colors - all ivory
-    style.Colors[ImGuiCol_Text] = ivory;
-    style.Colors[ImGuiCol_TextDisabled] = ImVec4(0.5f, 0.5f, 0.47f, 1.0f);
+    // Text colors
+    style.Colors[ImGuiCol_Text] = textPrimary;
+    style.Colors[ImGuiCol_TextDisabled] = textSecondary;
     
     // Frame/button colors
-    style.Colors[ImGuiCol_FrameBg] = darkSlate;
-    style.Colors[ImGuiCol_FrameBgHovered] = lightGrey;
-    style.Colors[ImGuiCol_FrameBgActive] = lightGrey;
+    style.Colors[ImGuiCol_FrameBg] = bgDarkest;
+    style.Colors[ImGuiCol_FrameBgHovered] = bgLight;
+    style.Colors[ImGuiCol_FrameBgActive] = bgMid;
     
     // Button colors
-    style.Colors[ImGuiCol_Button] = lightGrey;
-    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.45f, 0.47f, 0.49f, 1.0f);
-    style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.25f, 0.27f, 0.29f, 1.0f);
+    style.Colors[ImGuiCol_Button] = bgLight;
+    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.25f, 0.25f, 0.25f, 1.0f);
+    style.Colors[ImGuiCol_ButtonActive] = bgMid;
     
-    // Header colors
-    style.Colors[ImGuiCol_Header] = lightGrey;
-    style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.45f, 0.47f, 0.49f, 1.0f);
-    style.Colors[ImGuiCol_HeaderActive] = ImVec4(0.25f, 0.27f, 0.29f, 1.0f);
+    // Header colors (collapsing headers, tree nodes)
+    style.Colors[ImGuiCol_Header] = bgMid;
+    style.Colors[ImGuiCol_HeaderHovered] = bgLight;
+    style.Colors[ImGuiCol_HeaderActive] = accentBlue;
     
     // Title bar
-    style.Colors[ImGuiCol_TitleBg] = darkSlate;
-    style.Colors[ImGuiCol_TitleBgActive] = lightGrey;
-    style.Colors[ImGuiCol_TitleBgCollapsed] = darkSlate;
+    style.Colors[ImGuiCol_TitleBg] = bgDarkest;
+    style.Colors[ImGuiCol_TitleBgActive] = bgDark;
+    style.Colors[ImGuiCol_TitleBgCollapsed] = bgDarkest;
     
     // Scrollbar
-    style.Colors[ImGuiCol_ScrollbarBg] = darkSlate;
-    style.Colors[ImGuiCol_ScrollbarGrab] = lightGrey;
-    style.Colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.45f, 0.47f, 0.49f, 1.0f);
-    style.Colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.25f, 0.27f, 0.29f, 1.0f);
+    style.Colors[ImGuiCol_ScrollbarBg] = bgDarkest;
+    style.Colors[ImGuiCol_ScrollbarGrab] = bgLight;
+    style.Colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.30f, 0.30f, 0.30f, 1.0f);
+    style.Colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.35f, 0.35f, 0.35f, 1.0f);
     
     // Slider
-    style.Colors[ImGuiCol_SliderGrab] = lightGrey;
-    style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(0.25f, 0.27f, 0.29f, 1.0f);
+    style.Colors[ImGuiCol_SliderGrab] = accentBlue;
+    style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(0.30f, 0.70f, 0.95f, 1.0f);
     
     // Checkbox
-    style.Colors[ImGuiCol_CheckMark] = ivory;
-    
-    // Combo/Dropdown
-    style.Colors[ImGuiCol_PopupBg] = slateGrey;
+    style.Colors[ImGuiCol_CheckMark] = accentBlue;
     
     // Separator
-    style.Colors[ImGuiCol_Separator] = lightGrey;
-    style.Colors[ImGuiCol_SeparatorHovered] = ImVec4(0.45f, 0.47f, 0.49f, 1.0f);
-    style.Colors[ImGuiCol_SeparatorActive] = ImVec4(0.25f, 0.27f, 0.29f, 1.0f);
+    style.Colors[ImGuiCol_Separator] = borderColor;
+    style.Colors[ImGuiCol_SeparatorHovered] = accentBlue;
+    style.Colors[ImGuiCol_SeparatorActive] = accentBlue;
     
     // Resize grip
-    style.Colors[ImGuiCol_ResizeGrip] = lightGrey;
-    style.Colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.45f, 0.47f, 0.49f, 1.0f);
-    style.Colors[ImGuiCol_ResizeGripActive] = ImVec4(0.25f, 0.27f, 0.29f, 1.0f);
+    style.Colors[ImGuiCol_ResizeGrip] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    style.Colors[ImGuiCol_ResizeGripHovered] = accentBlue;
+    style.Colors[ImGuiCol_ResizeGripActive] = accentBlue;
     
     // Tab
-    style.Colors[ImGuiCol_Tab] = darkSlate;
-    style.Colors[ImGuiCol_TabHovered] = lightGrey;
-    style.Colors[ImGuiCol_TabActive] = lightGrey;
-    style.Colors[ImGuiCol_TabUnfocused] = darkSlate;
-    style.Colors[ImGuiCol_TabUnfocusedActive] = slateGrey;
+    style.Colors[ImGuiCol_Tab] = bgDark;
+    style.Colors[ImGuiCol_TabHovered] = bgLight;
+    style.Colors[ImGuiCol_TabActive] = bgMid;
+    style.Colors[ImGuiCol_TabUnfocused] = bgDarkest;
+    style.Colors[ImGuiCol_TabUnfocusedActive] = bgDark;
     
     // Docking
-    style.Colors[ImGuiCol_DockingPreview] = ImVec4(lightGrey.x, lightGrey.y, lightGrey.z, 0.3f);
-    style.Colors[ImGuiCol_DockingEmptyBg] = darkSlate;
+    style.Colors[ImGuiCol_DockingPreview] = ImVec4(accentBlue.x, accentBlue.y, accentBlue.z, 0.4f);
+    style.Colors[ImGuiCol_DockingEmptyBg] = bgDarkest;
+    
+    // Table
+    style.Colors[ImGuiCol_TableHeaderBg] = bgMid;
+    style.Colors[ImGuiCol_TableBorderStrong] = borderColor;
+    style.Colors[ImGuiCol_TableBorderLight] = ImVec4(0.15f, 0.15f, 0.15f, 1.0f);
     
     // Setup Platform/Renderer backends
     ImGui_ImplGlfw_InitForOpenGL(window, true);
@@ -495,9 +530,21 @@ bool MainWindow::initializeAudio() {
             }
         }
         
+        // Check if any track is soloed
+        bool anySolo = false;
+        for (const auto& track : tracks_) {
+            if (track.isSolo) {
+                anySolo = true;
+                break;
+            }
+        }
+        
         // Mix all recording tracks (armed tracks get live MIDI input)
         for (auto& track : tracks_) {
             if (track.synth) {
+                // Skip muted tracks, or non-soloed tracks when solo is active
+                bool shouldPlay = !track.isMuted && (!anySolo || track.isSolo);
+                
                 AudioBuffer trackBuffer(output.getNumChannels(), numFrames);
                 track.synth->generateAudio(trackBuffer, numFrames);
                 
@@ -509,19 +556,31 @@ bool MainWindow::initializeAudio() {
                 }
                 
                 // Capture waveform samples for visualization (use first channel, after effects)
+                // Also calculate peak level for metering
                 if (trackBuffer.getNumChannels() > 0) {
                     const float* trackSamples = trackBuffer.getReadPointer(0);
+                    float maxSample = 0.0f;
                     for (size_t i = 0; i < numFrames; ++i) {
                         track.addWaveformSample(trackSamples[i]);
+                        float absSample = std::abs(trackSamples[i]);
+                        if (absSample > maxSample) maxSample = absSample;
+                    }
+                    // Smooth peak level (fast attack, slow decay)
+                    if (maxSample > track.peakLevel) {
+                        track.peakLevel = maxSample;
+                    } else {
+                        track.peakLevel = track.peakLevel * 0.95f;  // Decay
                     }
                 }
                 
-                // Mix into output
-                for (size_t ch = 0; ch < output.getNumChannels(); ++ch) {
-                    const float* trackSamples = trackBuffer.getReadPointer(ch);
-                    float* outputSamples = output.getWritePointer(ch);
-                    for (size_t i = 0; i < numFrames; ++i) {
-                        outputSamples[i] += trackSamples[i];
+                // Mix into output (only if track should play)
+                if (shouldPlay) {
+                    for (size_t ch = 0; ch < output.getNumChannels(); ++ch) {
+                        const float* trackSamples = trackBuffer.getReadPointer(ch);
+                        float* outputSamples = output.getWritePointer(ch);
+                        for (size_t i = 0; i < numFrames; ++i) {
+                            outputSamples[i] += trackSamples[i];
+                        }
                     }
                 }
             } else {
@@ -536,6 +595,33 @@ bool MainWindow::initializeAudio() {
         if (isPlaying_) {
             playbackSamplePosition_ += numFrames;
         }
+        
+        // Calculate master output levels for metering
+        float maxL = 0.0f, maxR = 0.0f;
+        if (output.getNumChannels() >= 2) {
+            const float* leftSamples = output.getReadPointer(0);
+            const float* rightSamples = output.getReadPointer(1);
+            for (size_t i = 0; i < numFrames; ++i) {
+                float absL = std::abs(leftSamples[i]);
+                float absR = std::abs(rightSamples[i]);
+                if (absL > maxL) maxL = absL;
+                if (absR > maxR) maxR = absR;
+            }
+        } else if (output.getNumChannels() >= 1) {
+            const float* samples = output.getReadPointer(0);
+            for (size_t i = 0; i < numFrames; ++i) {
+                float absSample = std::abs(samples[i]);
+                if (absSample > maxL) maxL = absSample;
+            }
+            maxR = maxL;
+        }
+        
+        // Smooth peak levels (fast attack, slow decay)
+        if (maxL > masterPeakL_) masterPeakL_ = maxL;
+        else masterPeakL_ = masterPeakL_ * 0.95f;
+        
+        if (maxR > masterPeakR_) masterPeakR_ = maxR;
+        else masterPeakR_ = masterPeakR_ * 0.95f;
     });
     
     // Start audio engine
@@ -831,19 +917,19 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
         ImGui::SetNextWindowDockID(target_dock_id, ImGuiCond_Always);
     }
     
+    // Ableton-style dark sidebar
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.098f, 0.098f, 0.098f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.18f, 0.18f, 0.18f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.25f, 0.25f, 0.25f, 1.0f));
+    
     ImGui::Begin("Sample Library", nullptr, ImGuiWindowFlags_None);
     
-    // Title above Basic Waves - centered
-    float windowWidth = ImGui::GetWindowWidth();
-    const char* libraryText = "Library";
-    float textWidth = ImGui::CalcTextSize(libraryText).x;
-    ImGui::SetCursorPosX((windowWidth - textWidth) * 0.5f);
-    ImGui::Text("%s", libraryText);
-    ImGui::Separator();
+    // Title - "BROWSER" style like Ableton
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "BROWSER");
     ImGui::Spacing();
     
     // Basic Waves section
-    if (ImGui::CollapsingHeader("Basic Waves", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader("Sounds", ImGuiTreeNodeFlags_DefaultOpen)) {
         const char* waveNames[] = { "Sine", "Square", "Sawtooth", "Triangle" };
         Waveform waveforms[] = { 
             Waveform::Sine, 
@@ -852,15 +938,16 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
             Waveform::Triangle 
         };
         
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.2f, 0.2f, 1.0f));
+        
         for (int i = 0; i < 4; ++i) {
             ImGui::PushID(i);
             
-            // Make waveform draggable
-            if (ImGui::Button(waveNames[i], ImVec2(-1, 0))) {
+            if (ImGui::Button(waveNames[i], ImVec2(-1, 22))) {
                 // Click to select
             }
             
-            // Setup drag source (ImGui will automatically detect if button is being dragged)
             if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
                 ImGui::SetDragDropPayload("WAVEFORM", &waveforms[i], sizeof(Waveform));
                 ImGui::Text("Dragging %s", waveNames[i]);
@@ -869,6 +956,8 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
             
             ImGui::PopID();
         }
+        
+        ImGui::PopStyleColor(2);
     }
     
     // Instruments section with sub-categories
@@ -879,19 +968,20 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
             categoryMap[instrumentPresets_[i].category].push_back(i);
         }
         
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.2f, 0.2f, 1.0f));
+        
         // Render each category
         for (const auto& [category, indices] : categoryMap) {
             if (ImGui::TreeNode(category.c_str())) {
                 for (size_t idx : indices) {
                     const auto& preset = instrumentPresets_[idx];
-                    ImGui::PushID(static_cast<int>(idx + 1000));  // Offset to avoid collision with waveforms
+                    ImGui::PushID(static_cast<int>(idx + 1000));
                     
-                    // Make instrument preset draggable
-                    if (ImGui::Button(preset.name.c_str(), ImVec2(-1, 0))) {
+                    if (ImGui::Button(preset.name.c_str(), ImVec2(-1, 22))) {
                         // Click to select
                     }
                     
-                    // Setup drag source
                     if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
                         ImGui::SetDragDropPayload("INSTRUMENT", &idx, sizeof(size_t));
                         ImGui::Text("Dragging %s", preset.name.c_str());
@@ -903,21 +993,26 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
                 ImGui::TreePop();
             }
         }
+        
+        ImGui::PopStyleColor(2);
     }
     
     // User Presets section
     if (ImGui::CollapsingHeader("Presets", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (userPresets_.empty()) {
-            ImGui::TextDisabled("No saved presets");
+            ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f), "  No saved presets");
         } else {
             for (size_t i = 0; i < userPresets_.size(); ++i) {
                 const auto& preset = userPresets_[i];
-                ImGui::PushID(static_cast<int>(i + 5000));  // Offset to avoid collision
+                ImGui::PushID(static_cast<int>(i + 5000));
                 
-                // Make user preset draggable
+                // Ableton-style selectable item
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.2f, 0.2f, 1.0f));
                 if (ImGui::Button(preset.name.c_str(), ImVec2(-1, 0))) {
                     // Click to select
                 }
+                ImGui::PopStyleColor(2);
                 
                 // Right-click context menu for deletion
                 if (ImGui::BeginPopupContextItem()) {
@@ -927,7 +1022,7 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
                         markDirty();
                         ImGui::EndPopup();
                         ImGui::PopID();
-                        break;  // Exit loop since we modified the vector
+                        break;
                     }
                     ImGui::EndPopup();
                 }
@@ -945,6 +1040,7 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
     }
     
     ImGui::End();
+    ImGui::PopStyleColor(3);  // Pop library-specific colors
 #endif
 }
 
@@ -970,18 +1066,39 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
             ImVec2 contentSize = ImGui::GetContentRegionAvail();
             ImGui::BeginChild("ComponentsDropZone", ImVec2(contentSize.x, contentSize.y), false);
             
-            // Show track name at top
+            // Show track name at top - Ableton style
             if (!tracks_.empty() && selectedTrackIndex_ < tracks_.size()) {
-                char trackLabel[64];
-                snprintf(trackLabel, sizeof(trackLabel), "Track %zu Components:", selectedTrackIndex_ + 1);
-                ImGui::Text("%s", trackLabel);
+                // Track indicator with color
+                static const ImU32 trackColors[16] = {
+                    IM_COL32(255, 94, 94, 255), IM_COL32(255, 149, 0, 255),
+                    IM_COL32(255, 212, 0, 255), IM_COL32(132, 214, 79, 255),
+                    IM_COL32(0, 199, 140, 255), IM_COL32(51, 153, 219, 255),
+                    IM_COL32(138, 103, 219, 255), IM_COL32(219, 103, 186, 255),
+                    IM_COL32(255, 128, 128, 255), IM_COL32(255, 179, 102, 255),
+                    IM_COL32(255, 230, 102, 255), IM_COL32(179, 230, 128, 255),
+                    IM_COL32(102, 217, 191, 255), IM_COL32(128, 191, 230, 255),
+                    IM_COL32(179, 153, 230, 255), IM_COL32(230, 153, 204, 255)
+                };
                 
-                // "Save Preset" button next to label
+                // Color indicator dot
+                ImDrawList* drawList = ImGui::GetWindowDrawList();
+                ImVec2 dotPos = ImGui::GetCursorScreenPos();
+                int colorIdx = tracks_[selectedTrackIndex_].colorIndex % 16;
+                drawList->AddCircleFilled(ImVec2(dotPos.x + 6, dotPos.y + 8), 5.0f, trackColors[colorIdx]);
+                ImGui::Dummy(ImVec2(16, 0));
                 ImGui::SameLine();
-                if (ImGui::Button("Save Preset", ImVec2(100, 0))) {
-                    // Open dialog to name the preset
+                
+                char trackLabel[64];
+                snprintf(trackLabel, sizeof(trackLabel), "Track %zu", selectedTrackIndex_ + 1);
+                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "%s", trackLabel);
+                
+                // "Save Preset" button
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.15f, 0.15f, 1.0f));
+                if (ImGui::Button("Save Preset", ImVec2(90, 20))) {
                     ImGui::OpenPopup("SavePresetDialog");
                 }
+                ImGui::PopStyleColor();
                 
                 // Save preset dialog
                 if (ImGui::BeginPopupModal("SavePresetDialog", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -1154,72 +1271,103 @@ void MainWindow::renderComponentBox(size_t trackIndex, size_t oscIndex, Oscillat
 #ifdef PAN_USE_GUI
     ImGui::PushID(static_cast<int>(oscIndex + 10000 * trackIndex));
     
-    // Get background color and create lighter shades for sliders
-    ImVec4 bgColor = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg);
-    ImVec4 sliderGrab = ImVec4(bgColor.x * 1.8f, bgColor.y * 1.8f, bgColor.z * 1.8f, 1.0f);
-    ImVec4 sliderGrabActive = ImVec4(bgColor.x * 2.2f, bgColor.y * 2.2f, bgColor.z * 2.2f, 1.0f);
-    ImVec4 frameBg = ImVec4(bgColor.x * 1.3f, bgColor.y * 1.3f, bgColor.z * 1.3f, 1.0f);
-    ImVec4 frameBgHovered = ImVec4(bgColor.x * 1.5f, bgColor.y * 1.5f, bgColor.z * 1.5f, 1.0f);
-    ImVec4 frameBgActive = ImVec4(bgColor.x * 1.7f, bgColor.y * 1.7f, bgColor.z * 1.7f, 1.0f);
-    
-    // Push lighter slider colors for better visibility
-    ImGui::PushStyleColor(ImGuiCol_SliderGrab, sliderGrab);
-    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, sliderGrabActive);
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, frameBg);
-    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, frameBgHovered);
-    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, frameBgActive);
-    
-    // Component box - bordered rectangle
-    ImGui::BeginChild(ImGui::GetID("component_box"), ImVec2(250, 120), true, ImGuiWindowFlags_None);
-    
-    // Component header with remove button
     const char* waveNames[] = { "Sine", "Square", "Sawtooth", "Triangle" };
     const char* waveName = waveNames[static_cast<int>(osc.waveform)];
-    ImGui::Text("%s", waveName);
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60);
     
+    // Ableton-style device box
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.12f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.22f, 0.22f, 0.22f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+    
+    ImGui::BeginChild(ImGui::GetID("component_box"), ImVec2(180, 140), true, ImGuiWindowFlags_None);
+    
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    ImVec2 boxPos = ImGui::GetWindowPos();
+    float boxWidth = ImGui::GetWindowWidth();
+    
+    // Header bar with waveform name
+    float headerHeight = 24.0f;
+    drawList->AddRectFilled(boxPos, ImVec2(boxPos.x + boxWidth, boxPos.y + headerHeight),
+                           IM_COL32(45, 45, 45, 255), 4.0f, ImDrawFlags_RoundCornersTop);
+    
+    // Title
+    drawList->AddText(ImVec2(boxPos.x + 8, boxPos.y + 4), IM_COL32(200, 200, 200, 255), waveName);
+    
+    // Close button (X)
     auto& oscillators = tracks_[trackIndex].oscillators;
-    if (oscillators.size() > 1 && ImGui::Button("X", ImVec2(30, 0))) {
-        oscillators.erase(oscillators.begin() + oscIndex);
-        tracks_[trackIndex].synth->setOscillators(oscillators);
-        markDirty();
-        ImGui::EndChild();
-        ImGui::PopStyleColor(5);
-        ImGui::PopID();
-        return;
+    if (oscillators.size() > 1) {
+        ImVec2 closePos(boxPos.x + boxWidth - 20, boxPos.y + 4);
+        ImVec2 mousePos = ImGui::GetMousePos();
+        bool closeHovered = (mousePos.x >= closePos.x - 4 && mousePos.x <= closePos.x + 16 &&
+                            mousePos.y >= closePos.y - 2 && mousePos.y <= closePos.y + 18);
+        
+        if (closeHovered) {
+            drawList->AddRectFilled(ImVec2(closePos.x - 4, closePos.y - 2),
+                                   ImVec2(closePos.x + 12, closePos.y + 16),
+                                   IM_COL32(255, 94, 94, 100), 2.0f);
+        }
+        drawList->AddText(closePos, IM_COL32(120, 120, 120, 255), "x");
+        
+        if (closeHovered && ImGui::IsMouseClicked(0)) {
+            oscillators.erase(oscillators.begin() + oscIndex);
+            tracks_[trackIndex].synth->setOscillators(oscillators);
+            markDirty();
+            ImGui::EndChild();
+            ImGui::PopStyleVar(2);
+            ImGui::PopStyleColor(2);
+            ImGui::PopID();
+            return;
+        }
     }
     
-    ImGui::Separator();
+    // Skip past header
+    ImGui::Dummy(ImVec2(0, headerHeight - 8));
+    ImGui::Spacing();
     
-    // Waveform selector
+    // Ableton-style slider colors
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.07f, 0.07f, 0.07f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.10f, 0.10f, 0.10f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0.20f, 0.60f, 0.86f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0.30f, 0.70f, 0.95f, 1.0f));
+    
+    // Waveform selector - compact
+    ImGui::SetNextItemWidth(100);
     int currentWave = static_cast<int>(osc.waveform);
-    if (ImGui::Combo("Wave", &currentWave, waveNames, 4)) {
+    if (ImGui::Combo("##wave", &currentWave, waveNames, 4)) {
         osc.waveform = static_cast<Waveform>(currentWave);
         tracks_[trackIndex].synth->setOscillators(oscillators);
         markDirty();
     }
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Wave");
     
     // Frequency multiplier
+    ImGui::SetNextItemWidth(100);
     float freqMult = osc.frequencyMultiplier;
-    if (ImGui::SliderFloat("Freq", &freqMult, 0.1f, 4.0f, "%.2fx")) {
+    if (ImGui::SliderFloat("##freq", &freqMult, 0.1f, 4.0f, "%.2f")) {
         osc.frequencyMultiplier = freqMult;
         tracks_[trackIndex].synth->setOscillators(oscillators);
         markDirty();
     }
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Freq");
     
     // Amplitude
+    ImGui::SetNextItemWidth(100);
     float amp = osc.amplitude;
-    if (ImGui::SliderFloat("Amp", &amp, 0.0f, 1.0f, "%.2f")) {
+    if (ImGui::SliderFloat("##amp", &amp, 0.0f, 1.0f, "%.2f")) {
         osc.amplitude = amp;
         tracks_[trackIndex].synth->setOscillators(oscillators);
         markDirty();
     }
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Amp");
     
+    ImGui::PopStyleColor(4);
     ImGui::EndChild();
-    
-    // Pop slider style colors
-    ImGui::PopStyleColor(5);
-    
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
     ImGui::PopID();
 #endif
 }
@@ -1230,130 +1378,148 @@ void MainWindow::renderEffectBox(size_t trackIndex, size_t effectIndex, std::sha
     
     ImGui::PushID(static_cast<int>(effectIndex + 20000 * trackIndex));
     
-    // Get background color and create lighter shades for sliders
-    ImVec4 bgColor = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg);
-    ImVec4 sliderGrab = ImVec4(bgColor.x * 1.8f, bgColor.y * 1.8f, bgColor.z * 1.8f, 1.0f);
-    ImVec4 sliderGrabActive = ImVec4(bgColor.x * 2.2f, bgColor.y * 2.2f, bgColor.z * 2.2f, 1.0f);
-    ImVec4 frameBg = ImVec4(bgColor.x * 1.3f, bgColor.y * 1.3f, bgColor.z * 1.3f, 1.0f);
-    ImVec4 frameBgHovered = ImVec4(bgColor.x * 1.5f, bgColor.y * 1.5f, bgColor.z * 1.5f, 1.0f);
-    ImVec4 frameBgActive = ImVec4(bgColor.x * 1.7f, bgColor.y * 1.7f, bgColor.z * 1.7f, 1.0f);
-    
-    // Push lighter slider colors for better visibility
-    ImGui::PushStyleColor(ImGuiCol_SliderGrab, sliderGrab);
-    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, sliderGrabActive);
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, frameBg);
-    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, frameBgHovered);
-    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, frameBgActive);
-    
-    // Effect box - bordered rectangle
-    ImGui::BeginChild(ImGui::GetID("effect_box"), ImVec2(280, 220), true, ImGuiWindowFlags_None);
-    
-    // Check if this is a Reverb effect for preset dropdown
     auto reverb = std::dynamic_pointer_cast<Reverb>(effect);
     
-    // Effect header with preset dropdown (for reverb)
-    if (reverb) {
-        // Make the title a combo box for preset selection
-        const char* currentPresetName = Reverb::getPresetName(reverb->getCurrentPreset());
-        char comboLabel[64];
-        snprintf(comboLabel, sizeof(comboLabel), "Reverb: %s", currentPresetName);
-        
-        if (ImGui::BeginCombo("##preset", comboLabel, ImGuiComboFlags_NoArrowButton)) {
-            for (int i = 0; i < 7; ++i) {
-                Reverb::Preset preset = static_cast<Reverb::Preset>(i);
-                const char* presetName = Reverb::getPresetName(preset);
-                bool isSelected = (reverb->getCurrentPreset() == preset);
-                
-                if (ImGui::Selectable(presetName, isSelected)) {
-                    reverb->loadPreset(preset);
-                    markDirty();
-                }
-                
-                if (isSelected) {
-                    ImGui::SetItemDefaultFocus();
-                }
-            }
-            ImGui::EndCombo();
-        }
-    } else {
-        ImGui::Text("%s", effect->getName().c_str());
-    }
+    // Ableton-style effect device box
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.12f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.22f, 0.22f, 0.22f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
     
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 80);
+    ImGui::BeginChild(ImGui::GetID("effect_box"), ImVec2(200, 200), true, ImGuiWindowFlags_None);
     
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    ImVec2 boxPos = ImGui::GetWindowPos();
+    float boxWidth = ImGui::GetWindowWidth();
+    
+    // Header bar
+    float headerHeight = 24.0f;
     bool enabled = effect->isEnabled();
-    if (ImGui::Checkbox("On", &enabled)) {
-        effect->setEnabled(enabled);
+    ImU32 headerColor = enabled ? IM_COL32(51, 153, 219, 255) : IM_COL32(45, 45, 45, 255);
+    drawList->AddRectFilled(boxPos, ImVec2(boxPos.x + boxWidth, boxPos.y + headerHeight),
+                           headerColor, 4.0f, ImDrawFlags_RoundCornersTop);
+    
+    // Effect name
+    const char* effectName = reverb ? "Reverb" : effect->getName().c_str();
+    drawList->AddText(ImVec2(boxPos.x + 8, boxPos.y + 4), 
+                     enabled ? IM_COL32(255, 255, 255, 255) : IM_COL32(150, 150, 150, 255), 
+                     effectName);
+    
+    // Enable/disable button (power icon simulation)
+    ImVec2 powerPos(boxPos.x + boxWidth - 40, boxPos.y + 3);
+    ImVec2 mousePos = ImGui::GetMousePos();
+    bool powerHovered = (mousePos.x >= powerPos.x && mousePos.x <= powerPos.x + 18 &&
+                        mousePos.y >= powerPos.y && mousePos.y <= powerPos.y + 18);
+    
+    ImU32 powerColor = enabled ? IM_COL32(255, 255, 255, 255) : IM_COL32(100, 100, 100, 255);
+    drawList->AddCircle(ImVec2(powerPos.x + 9, powerPos.y + 9), 7.0f, powerColor, 0, 2.0f);
+    drawList->AddLine(ImVec2(powerPos.x + 9, powerPos.y + 2), 
+                     ImVec2(powerPos.x + 9, powerPos.y + 7), powerColor, 2.0f);
+    
+    if (powerHovered && ImGui::IsMouseClicked(0)) {
+        effect->setEnabled(!enabled);
         markDirty();
     }
     
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 30);
-    if (ImGui::Button("X", ImVec2(25, 0))) {
+    // Close button
+    ImVec2 closePos(boxPos.x + boxWidth - 20, boxPos.y + 4);
+    bool closeHovered = (mousePos.x >= closePos.x - 4 && mousePos.x <= closePos.x + 16 &&
+                        mousePos.y >= closePos.y - 2 && mousePos.y <= closePos.y + 18);
+    
+    if (closeHovered) {
+        drawList->AddRectFilled(ImVec2(closePos.x - 4, closePos.y - 2),
+                               ImVec2(closePos.x + 12, closePos.y + 16),
+                               IM_COL32(255, 94, 94, 100), 2.0f);
+    }
+    drawList->AddText(closePos, IM_COL32(200, 200, 200, 255), "x");
+    
+    if (closeHovered && ImGui::IsMouseClicked(0)) {
         tracks_[trackIndex].effects.erase(tracks_[trackIndex].effects.begin() + effectIndex);
         markDirty();
         ImGui::EndChild();
-        ImGui::PopStyleColor(5);
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(2);
         ImGui::PopID();
         return;
     }
     
-    ImGui::Separator();
+    // Skip past header
+    ImGui::Dummy(ImVec2(0, headerHeight - 8));
+    ImGui::Spacing();
     
-    // Show parameters if this is a Reverb
+    // Slider styling
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.07f, 0.07f, 0.07f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.10f, 0.10f, 0.10f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0.20f, 0.60f, 0.86f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0.30f, 0.70f, 0.95f, 1.0f));
+    
     if (reverb) {
+        // Preset selector
+        ImGui::SetNextItemWidth(120);
+        const char* currentPresetName = Reverb::getPresetName(reverb->getCurrentPreset());
+        if (ImGui::BeginCombo("##preset", currentPresetName)) {
+            for (int i = 0; i < 7; ++i) {
+                Reverb::Preset preset = static_cast<Reverb::Preset>(i);
+                const char* presetName = Reverb::getPresetName(preset);
+                if (ImGui::Selectable(presetName, reverb->getCurrentPreset() == preset)) {
+                    reverb->loadPreset(preset);
+                    markDirty();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        
         bool anyChanged = false;
         
-        // Room Size
+        ImGui::SetNextItemWidth(120);
         float roomSize = reverb->getRoomSize();
-        if (ImGui::SliderFloat("Room Size", &roomSize, 0.0f, 1.0f, "%.2f")) {
+        if (ImGui::SliderFloat("##room", &roomSize, 0.0f, 1.0f, "%.2f")) {
             reverb->setRoomSize(roomSize);
             anyChanged = true;
             markDirty();
         }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Size");
         
-        // Damping
-        float damping = reverb->getDamping();
-        if (ImGui::SliderFloat("Damping", &damping, 0.0f, 1.0f, "%.2f")) {
-            reverb->setDamping(damping);
-            anyChanged = true;
-            markDirty();
-        }
-        
-        // Wet Level
+        ImGui::SetNextItemWidth(120);
         float wet = reverb->getWetLevel();
-        if (ImGui::SliderFloat("Wet", &wet, 0.0f, 1.0f, "%.2f")) {
+        if (ImGui::SliderFloat("##wet", &wet, 0.0f, 1.0f, "%.2f")) {
             reverb->setWetLevel(wet);
             anyChanged = true;
             markDirty();
         }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Wet");
         
-        // Dry Level
+        ImGui::SetNextItemWidth(120);
         float dry = reverb->getDryLevel();
-        if (ImGui::SliderFloat("Dry", &dry, 0.0f, 1.0f, "%.2f")) {
+        if (ImGui::SliderFloat("##dry", &dry, 0.0f, 1.0f, "%.2f")) {
             reverb->setDryLevel(dry);
             anyChanged = true;
             markDirty();
         }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Dry");
         
-        // Width
-        float width = reverb->getWidth();
-        if (ImGui::SliderFloat("Width", &width, 0.0f, 1.0f, "%.2f")) {
-            reverb->setWidth(width);
+        ImGui::SetNextItemWidth(120);
+        float damping = reverb->getDamping();
+        if (ImGui::SliderFloat("##damp", &damping, 0.0f, 1.0f, "%.2f")) {
+            reverb->setDamping(damping);
             anyChanged = true;
             markDirty();
         }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Damp");
         
-        // If any parameter changed manually and current preset isn't Custom, mark as Custom
         if (anyChanged && reverb->getCurrentPreset() != Reverb::Preset::Custom) {
             reverb->setCurrentPreset(Reverb::Preset::Custom);
         }
     }
     
+    ImGui::PopStyleColor(4);
     ImGui::EndChild();
-    
-    // Pop slider style colors
-    ImGui::PopStyleColor(5);
-    
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
     ImGui::PopID();
 #endif
 }
@@ -1367,129 +1533,220 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
     
     ImGui::Begin("Tracks", nullptr, ImGuiWindowFlags_None);
     
-    // Get window info for drawing background (declare at function scope)
+    // Ableton-inspired track color palette (16 colors)
+    static const ImU32 trackColors[16] = {
+        IM_COL32(255, 94, 94, 255),   // Red
+        IM_COL32(255, 149, 0, 255),   // Orange  
+        IM_COL32(255, 212, 0, 255),   // Yellow
+        IM_COL32(132, 214, 79, 255),  // Lime
+        IM_COL32(0, 199, 140, 255),   // Teal
+        IM_COL32(51, 153, 219, 255),  // Blue
+        IM_COL32(138, 103, 219, 255), // Purple
+        IM_COL32(219, 103, 186, 255), // Pink
+        IM_COL32(255, 128, 128, 255), // Light red
+        IM_COL32(255, 179, 102, 255), // Peach
+        IM_COL32(255, 230, 102, 255), // Light yellow
+        IM_COL32(179, 230, 128, 255), // Light lime
+        IM_COL32(102, 217, 191, 255), // Light teal
+        IM_COL32(128, 191, 230, 255), // Light blue
+        IM_COL32(179, 153, 230, 255), // Light purple
+        IM_COL32(230, 153, 204, 255)  // Light pink
+    };
+    
+    // Get window info for drawing
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     ImVec2 windowPos = ImGui::GetWindowPos();
     ImVec2 windowSize = ImGui::GetWindowSize();
-    ImU32 darkerBgColor = IM_COL32(31, 36, 41, 255);  // Dark background matching mockup
     
-    // Draw dark background for entire window (behind everything)
-    drawList->AddRectFilled(
-        windowPos,
-        ImVec2(windowPos.x + windowSize.x, windowPos.y + windowSize.y),
-        darkerBgColor
-    );
+    // Dark background
+    drawList->AddRectFilled(windowPos, ImVec2(windowPos.x + windowSize.x, windowPos.y + windowSize.y),
+                           IM_COL32(18, 18, 18, 255));
     
     // Split into two columns: left for track controls, right for timeline
     ImGui::Columns(2, "track_columns", false);
-    ImGui::SetColumnWidth(0, 400.0f);  // Left column: track controls
-    // Right column: timeline (auto-sized)
+    ImGui::SetColumnWidth(0, 280.0f);  // Narrower track header (Ableton-style)
     
-    // Render all real tracks
+    // Render all tracks
     for (size_t i = 0; i < tracks_.size(); ++i) {
         ImGui::PushID(static_cast<int>(i));
         
-        // Add spacing between tracks
-        if (i > 0) {
-            ImGui::Spacing();
-            ImGui::Spacing();
+        // Assign track color if not set
+        if (tracks_[i].colorIndex == 0 && i > 0) {
+            tracks_[i].colorIndex = static_cast<int>(i % 16);
         }
         
-        // LEFT COLUMN: Track header
-        float headerHeight = 120.0f;
+        float headerHeight = 64.0f;  // More compact Ableton-style
         float columnWidth = ImGui::GetColumnWidth(0);
+        float colorBarWidth = 6.0f;
         ImVec2 headerStartPos = ImGui::GetCursorScreenPos();
         
-        // Draw track header background rectangle (highlight if selected)
         bool isSelected = (i == selectedTrackIndex_);
-        ImU32 trackHeaderBg;
-        if (isSelected) {
-            // Selected track - brighter/highlighted color
-            trackHeaderBg = IM_COL32(90, 100, 110, 255);
-        } else {
-            // Normal alternating colors
-            trackHeaderBg = (i % 2 == 0) ? IM_COL32(70, 75, 80, 255) : IM_COL32(75, 80, 85, 255);
-        }
-        drawList->AddRectFilled(
-            headerStartPos,
-            ImVec2(headerStartPos.x + columnWidth, headerStartPos.y + headerHeight),
-            trackHeaderBg
-        );
-        
-        // Add selection border if selected
-        if (isSelected) {
-            drawList->AddRect(
-                headerStartPos,
-                ImVec2(headerStartPos.x + columnWidth, headerStartPos.y + headerHeight),
-                IM_COL32(150, 170, 190, 255),
-                0.0f, 0, 2.0f
-            );
-        }
-        
-        // This is a real track - render normal track content
-        ImVec2 textSize = ImGui::CalcTextSize("Track 1");
-        float buttonWidth = 30.0f;
-        float spacing = 20.0f;
-        float totalWidth = textSize.x + spacing + buttonWidth;
-        ImVec2 headerCenter = ImVec2(headerStartPos.x + columnWidth / 2.0f, headerStartPos.y + headerHeight / 2.0f);
-        
-        // Track label - centered at top
-        char trackLabel[32];
-        snprintf(trackLabel, sizeof(trackLabel), "Track %zu", i + 1);
-        float trackLabelOffset = tracks_[i].instrumentName.empty() ? 0.0f : -10.0f;  // Move up if instrument name present
-        ImVec2 textPos = ImVec2(headerCenter.x - totalWidth / 2.0f, headerCenter.y - textSize.y / 2.0f + trackLabelOffset);
-        drawList->AddText(textPos, IM_COL32(250, 250, 240, 255), trackLabel);
-        
-        // Instrument name - below track label (if set)
-        if (!tracks_[i].instrumentName.empty()) {
-            ImVec2 instTextSize = ImGui::CalcTextSize(tracks_[i].instrumentName.c_str());
-            ImVec2 instTextPos = ImVec2(headerCenter.x - instTextSize.x / 2.0f, headerCenter.y + textSize.y / 2.0f + 2.0f);
-            // Draw in slightly dimmer color
-            drawList->AddText(instTextPos, IM_COL32(180, 180, 170, 255), tracks_[i].instrumentName.c_str());
-        }
-        
-        // Hot button - grey/red circle
-        ImVec2 buttonPos = ImVec2(textPos.x + textSize.x + spacing, headerCenter.y - 15.0f + trackLabelOffset);
-        ImVec2 buttonRectMin = ImVec2(buttonPos.x - 2, buttonPos.y - 2);
-        ImVec2 buttonRectMax = ImVec2(buttonPos.x + 32, buttonPos.y + 32);
-        
         ImVec2 mousePos = ImGui::GetMousePos();
-        bool isHovered = (mousePos.x >= buttonRectMin.x && mousePos.x <= buttonRectMax.x &&
-                         mousePos.y >= buttonRectMin.y && mousePos.y <= buttonRectMax.y);
         
-        if (isHovered && ImGui::IsMouseClicked(0)) {
+        // Track header background
+        ImU32 trackBg = isSelected ? IM_COL32(50, 50, 50, 255) : IM_COL32(35, 35, 35, 255);
+        drawList->AddRectFilled(headerStartPos, 
+                               ImVec2(headerStartPos.x + columnWidth, headerStartPos.y + headerHeight),
+                               trackBg);
+        
+        // Color bar on left edge
+        ImU32 trackColor = trackColors[tracks_[i].colorIndex % 16];
+        drawList->AddRectFilled(headerStartPos,
+                               ImVec2(headerStartPos.x + colorBarWidth, headerStartPos.y + headerHeight),
+                               trackColor);
+        
+        // Selection highlight
+        if (isSelected) {
+            drawList->AddRect(headerStartPos,
+                             ImVec2(headerStartPos.x + columnWidth, headerStartPos.y + headerHeight),
+                             IM_COL32(51, 153, 219, 255), 0.0f, 0, 2.0f);
+        }
+        
+        // Track number and name area
+        float contentStartX = headerStartPos.x + colorBarWidth + 8.0f;
+        float buttonSize = 20.0f;
+        float buttonSpacing = 4.0f;
+        
+        // Track number (larger font simulation)
+        char trackNum[8];
+        snprintf(trackNum, sizeof(trackNum), "%zu", i + 1);
+        drawList->AddText(ImVec2(contentStartX, headerStartPos.y + 8.0f), 
+                         IM_COL32(200, 200, 200, 255), trackNum);
+        
+        // Instrument name (smaller, secondary color)
+        if (!tracks_[i].instrumentName.empty()) {
+            drawList->AddText(ImVec2(contentStartX + 20.0f, headerStartPos.y + 8.0f),
+                             IM_COL32(150, 150, 150, 255), tracks_[i].instrumentName.c_str());
+        }
+        
+        // Button row: S M ● (Solo, Mute, Arm)
+        float buttonRowY = headerStartPos.y + 32.0f;
+        float buttonX = contentStartX;
+        
+        // Solo button (S)
+        ImVec2 soloMin(buttonX, buttonRowY);
+        ImVec2 soloMax(buttonX + buttonSize, buttonRowY + buttonSize);
+        bool soloHovered = (mousePos.x >= soloMin.x && mousePos.x <= soloMax.x &&
+                           mousePos.y >= soloMin.y && mousePos.y <= soloMax.y);
+        
+        ImU32 soloBg = tracks_[i].isSolo ? IM_COL32(176, 145, 46, 255) : 
+                       (soloHovered ? IM_COL32(60, 60, 60, 255) : IM_COL32(45, 45, 45, 255));
+        drawList->AddRectFilled(soloMin, soloMax, soloBg, 2.0f);
+        drawList->AddText(ImVec2(buttonX + 5.0f, buttonRowY + 2.0f),
+                         tracks_[i].isSolo ? IM_COL32(0, 0, 0, 255) : IM_COL32(180, 180, 180, 255), "S");
+        
+        if (soloHovered && ImGui::IsMouseClicked(0)) {
+            tracks_[i].isSolo = !tracks_[i].isSolo;
+        }
+        buttonX += buttonSize + buttonSpacing;
+        
+        // Mute button (M)  
+        ImVec2 muteMin(buttonX, buttonRowY);
+        ImVec2 muteMax(buttonX + buttonSize, buttonRowY + buttonSize);
+        bool muteHovered = (mousePos.x >= muteMin.x && mousePos.x <= muteMax.x &&
+                           mousePos.y >= muteMin.y && mousePos.y <= muteMax.y);
+        
+        ImU32 muteBg = tracks_[i].isMuted ? IM_COL32(255, 94, 94, 255) :
+                       (muteHovered ? IM_COL32(60, 60, 60, 255) : IM_COL32(45, 45, 45, 255));
+        drawList->AddRectFilled(muteMin, muteMax, muteBg, 2.0f);
+        drawList->AddText(ImVec2(buttonX + 4.0f, buttonRowY + 2.0f),
+                         tracks_[i].isMuted ? IM_COL32(0, 0, 0, 255) : IM_COL32(180, 180, 180, 255), "M");
+        
+        if (muteHovered && ImGui::IsMouseClicked(0)) {
+            tracks_[i].isMuted = !tracks_[i].isMuted;
+        }
+        buttonX += buttonSize + buttonSpacing;
+        
+        // Arm/Record button (circle)
+        ImVec2 armCenter(buttonX + buttonSize / 2.0f, buttonRowY + buttonSize / 2.0f);
+        float armRadius = 8.0f;
+        ImVec2 armMin(buttonX, buttonRowY);
+        ImVec2 armMax(buttonX + buttonSize, buttonRowY + buttonSize);
+        bool armHovered = (mousePos.x >= armMin.x && mousePos.x <= armMax.x &&
+                          mousePos.y >= armMin.y && mousePos.y <= armMax.y);
+        
+        // Arm button background
+        ImU32 armBg = armHovered ? IM_COL32(60, 60, 60, 255) : IM_COL32(45, 45, 45, 255);
+        drawList->AddRectFilled(armMin, armMax, armBg, 2.0f);
+        
+        // Arm circle (orange when armed)
+        ImU32 armColor = tracks_[i].isRecording ? IM_COL32(255, 149, 0, 255) : IM_COL32(100, 100, 100, 255);
+        drawList->AddCircleFilled(armCenter, armRadius, armColor);
+        if (tracks_[i].isRecording) {
+            // Glow effect when armed
+            drawList->AddCircle(armCenter, armRadius + 2.0f, IM_COL32(255, 149, 0, 80), 0, 2.0f);
+        }
+        
+        if (armHovered && ImGui::IsMouseClicked(0)) {
             tracks_[i].isRecording = !tracks_[i].isRecording;
         }
         
-        // Draw filled circle for hot button
-        ImVec2 center = ImVec2(buttonPos.x + 15, buttonPos.y + 15);
-        float radius = 10.0f;
-        ImU32 circleColor = tracks_[i].isRecording ? 
-            IM_COL32(255, 0, 0, 255) : IM_COL32(120, 120, 120, 255);
-        drawList->AddCircleFilled(center, radius, circleColor);
+        // Level meter (vertical bar on right side of track header)
+        float meterWidth = 6.0f;
+        float meterHeight = headerHeight - 8.0f;
+        float meterX = headerStartPos.x + columnWidth - meterWidth - 8.0f;
+        float meterY = headerStartPos.y + 4.0f;
         
-        // Remove track button (X) - only show if more than 1 track
+        // Meter background
+        drawList->AddRectFilled(ImVec2(meterX, meterY), 
+                               ImVec2(meterX + meterWidth, meterY + meterHeight),
+                               IM_COL32(25, 25, 25, 255));
+        
+        // Get current level from waveform buffer
+        float level = tracks_[i].peakLevel;
+        
+        // Update peak with decay
+        auto now = std::chrono::steady_clock::now();
+        double currentTime = std::chrono::duration<double>(now.time_since_epoch()).count();
+        
+        // Decay peak hold after 1 second
+        if (currentTime - tracks_[i].peakHoldTime > 1.0) {
+            tracks_[i].peakHold = std::max(0.0f, tracks_[i].peakHold - 0.02f);
+        }
+        
+        if (level > tracks_[i].peakHold) {
+            tracks_[i].peakHold = level;
+            tracks_[i].peakHoldTime = currentTime;
+        }
+        
+        // Draw level fill (green to yellow to red)
+        float levelHeight = level * meterHeight;
+        if (levelHeight > 0.0f) {
+            ImU32 levelColor = IM_COL32(132, 214, 79, 255);  // Green
+            if (level > 0.7f) levelColor = IM_COL32(255, 212, 0, 255);  // Yellow
+            if (level > 0.9f) levelColor = IM_COL32(255, 94, 94, 255);  // Red
+            
+            drawList->AddRectFilled(
+                ImVec2(meterX, meterY + meterHeight - levelHeight),
+                ImVec2(meterX + meterWidth, meterY + meterHeight),
+                levelColor);
+        }
+        
+        // Peak hold line
+        if (tracks_[i].peakHold > 0.01f) {
+            float peakY = meterY + meterHeight - (tracks_[i].peakHold * meterHeight);
+            drawList->AddLine(ImVec2(meterX, peakY), ImVec2(meterX + meterWidth, peakY),
+                             IM_COL32(255, 255, 255, 200), 1.0f);
+        }
+        
+        // Close button (X) - only if more than 1 track
         if (tracks_.size() > 1) {
-            ImVec2 xButtonPos = ImVec2(headerStartPos.x + columnWidth - 35.0f, headerStartPos.y + 5.0f);
-            ImVec2 xButtonRectMin = ImVec2(xButtonPos.x, xButtonPos.y);
-            ImVec2 xButtonRectMax = ImVec2(xButtonPos.x + 25, xButtonPos.y + 25);
+            float closeX = headerStartPos.x + columnWidth - 24.0f;
+            float closeY = headerStartPos.y + 4.0f;
+            ImVec2 closeMin(closeX, closeY);
+            ImVec2 closeMax(closeX + 16.0f, closeY + 16.0f);
+            bool closeHovered = (mousePos.x >= closeMin.x && mousePos.x <= closeMax.x &&
+                                mousePos.y >= closeMin.y && mousePos.y <= closeMax.y);
             
-            bool xHovered = (mousePos.x >= xButtonRectMin.x && mousePos.x <= xButtonRectMax.x &&
-                            mousePos.y >= xButtonRectMin.y && mousePos.y <= xButtonRectMax.y);
-            
-            if (xHovered) {
-                drawList->AddRectFilled(xButtonRectMin, xButtonRectMax, IM_COL32(100, 100, 100, 100));
+            if (closeHovered) {
+                drawList->AddRectFilled(closeMin, closeMax, IM_COL32(255, 94, 94, 100), 2.0f);
             }
+            drawList->AddText(ImVec2(closeX + 3.0f, closeY), IM_COL32(150, 150, 150, 255), "x");
             
-            drawList->AddText(xButtonPos, IM_COL32(250, 250, 240, 255), "X");
-            
-            if (xHovered && ImGui::IsMouseClicked(0)) {
+            if (closeHovered && ImGui::IsMouseClicked(0)) {
                 tracks_.erase(tracks_.begin() + i);
-                // Adjust selected track index if necessary
                 if (selectedTrackIndex_ >= tracks_.size() && !tracks_.empty()) {
                     selectedTrackIndex_ = tracks_.size() - 1;
-                } else if (tracks_.empty()) {
-                    selectedTrackIndex_ = 0;
                 }
                 markDirty();
                 ImGui::PopID();
@@ -1499,148 +1756,117 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
             }
         }
         
-        // Use Dummy to advance cursor and make track header clickable
+        // Bottom border
+        drawList->AddLine(ImVec2(headerStartPos.x, headerStartPos.y + headerHeight - 1),
+                         ImVec2(headerStartPos.x + columnWidth, headerStartPos.y + headerHeight - 1),
+                         IM_COL32(55, 55, 55, 255));
+        
+        // Invisible button for interaction
         ImGui::Dummy(ImVec2(columnWidth, headerHeight));
         
-        // Check if track header was clicked (for selection)
+        // Track selection on click
         if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(0)) {
-            // Only select if click wasn't on hot button or X button
-            ImVec2 mousePos = ImGui::GetMousePos();
-            bool clickedHotButton = (mousePos.x >= buttonRectMin.x && mousePos.x <= buttonRectMax.x &&
-                                     mousePos.y >= buttonRectMin.y && mousePos.y <= buttonRectMax.y);
-            bool clickedXButton = false;
+            // Check if click wasn't on any button
+            bool clickedButton = soloHovered || muteHovered || armHovered;
             if (tracks_.size() > 1) {
-                ImVec2 xButtonPos = ImVec2(headerStartPos.x + columnWidth - 35.0f, headerStartPos.y + 5.0f);
-                ImVec2 xButtonRectMin = ImVec2(xButtonPos.x, xButtonPos.y);
-                ImVec2 xButtonRectMax = ImVec2(xButtonPos.x + 25, xButtonPos.y + 25);
-                clickedXButton = (mousePos.x >= xButtonRectMin.x && mousePos.x <= xButtonRectMax.x &&
-                                 mousePos.y >= xButtonRectMin.y && mousePos.y <= xButtonRectMax.y);
+                float closeX = headerStartPos.x + columnWidth - 24.0f;
+                float closeY = headerStartPos.y + 4.0f;
+                clickedButton = clickedButton || (mousePos.x >= closeX && mousePos.x <= closeX + 16.0f &&
+                               mousePos.y >= closeY && mousePos.y <= closeY + 16.0f);
             }
-            
-            if (!clickedHotButton && !clickedXButton) {
+            if (!clickedButton) {
                 selectedTrackIndex_ = i;
             }
         }
         
         // Drop target for waveforms and instruments
         if (ImGui::BeginDragDropTarget()) {
-            // Accept single waveform
             if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("WAVEFORM")) {
                 if (payload->DataSize == sizeof(Waveform)) {
                     Waveform droppedWave = *(Waveform*)payload->Data;
-                    auto& oscillators = tracks_[i].oscillators;
-                    oscillators.push_back(Oscillator(droppedWave, 1.0f, 0.5f));
-                    tracks_[i].synth->setOscillators(oscillators);
+                    tracks_[i].oscillators.push_back(Oscillator(droppedWave, 1.0f, 0.5f));
+                    tracks_[i].synth->setOscillators(tracks_[i].oscillators);
                     tracks_[i].waveformSet = true;
-                    
-                    // Set instrument name based on waveform
                     const char* waveNames[] = { "Sine", "Square", "Sawtooth", "Triangle" };
                     tracks_[i].instrumentName = waveNames[static_cast<int>(droppedWave)];
-                    
-                    // Select this track when a sample is dropped on it
                     selectedTrackIndex_ = i;
                     markDirty();
                 }
             }
-            // Accept instrument preset
             if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("INSTRUMENT")) {
                 if (payload->DataSize == sizeof(size_t)) {
                     size_t presetIndex = *(size_t*)payload->Data;
                     if (presetIndex < instrumentPresets_.size()) {
                         const auto& preset = instrumentPresets_[presetIndex];
-                        // Replace all oscillators with the preset's oscillators
                         tracks_[i].oscillators = preset.oscillators;
                         tracks_[i].synth->setOscillators(tracks_[i].oscillators);
                         tracks_[i].waveformSet = true;
                         tracks_[i].instrumentName = preset.name;
-                        // Select this track
                         selectedTrackIndex_ = i;
                         markDirty();
-                        std::cout << "Loaded preset '" << preset.name << "' onto track " << i << std::endl;
                     }
                 }
             }
-            // Accept user preset
             if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("USER_PRESET")) {
                 if (payload->DataSize == sizeof(size_t)) {
                     size_t presetIndex = *(size_t*)payload->Data;
                     if (presetIndex < userPresets_.size()) {
                         const auto& preset = userPresets_[presetIndex];
-                        // Replace all oscillators with the preset's oscillators
                         tracks_[i].oscillators = preset.oscillators;
                         tracks_[i].synth->setOscillators(tracks_[i].oscillators);
                         tracks_[i].waveformSet = true;
                         tracks_[i].instrumentName = preset.name;
-                        // Select this track
                         selectedTrackIndex_ = i;
                         markDirty();
-                        std::cout << "Loaded user preset '" << preset.name << "' onto track " << i << std::endl;
                     }
                 }
             }
             ImGui::EndDragDropTarget();
         }
         
-        // RIGHT COLUMN: Timeline
+        // Timeline column
         ImGui::NextColumn();
         renderTrackTimeline(i);
         ImGui::NextColumn();
         
-        // Add separator between tracks (but not after last one)
-        if (i < tracks_.size() - 1) {
-            ImGui::Separator();
-            ImGui::NextColumn();
-            ImGui::Separator();
-            ImGui::NextColumn();
-        }
-        
         ImGui::PopID();
     }
     
-    // After all tracks are rendered, add "+ Add Track" button in left column only
+    // Add Track button
     ImGui::Spacing();
-    ImGui::Spacing();
+    float addColumnWidth = ImGui::GetColumnWidth(0);
+    ImVec2 addBtnPos = ImGui::GetCursorScreenPos();
+    ImVec2 addBtnSize(addColumnWidth - 16.0f, 28.0f);
+    addBtnPos.x += 8.0f;
     
-    // Draw "+ Add Track" button - centered in column
-    float columnWidth = ImGui::GetColumnWidth(0);
-    ImVec2 buttonStartPos = ImGui::GetCursorScreenPos();
-    ImVec2 buttonSize = ImVec2(100, 30);
-    // Center button horizontally in the column
-    float leftPadding = (columnWidth - buttonSize.x) / 2.0f;
-    ImVec2 buttonPos = ImVec2(buttonStartPos.x + leftPadding, buttonStartPos.y);
+    ImVec2 addMousePos = ImGui::GetMousePos();
+    bool addHovered = (addMousePos.x >= addBtnPos.x && addMousePos.x <= addBtnPos.x + addBtnSize.x &&
+                      addMousePos.y >= addBtnPos.y && addMousePos.y <= addBtnPos.y + addBtnSize.y);
     
-    ImVec2 mousePos = ImGui::GetMousePos();
-    bool isHovered = (mousePos.x >= buttonPos.x && mousePos.x <= buttonPos.x + buttonSize.x &&
-                     mousePos.y >= buttonPos.y && mousePos.y <= buttonPos.y + buttonSize.y);
+    ImU32 addBtnColor = addHovered ? IM_COL32(55, 55, 55, 255) : IM_COL32(40, 40, 40, 255);
+    drawList->AddRectFilled(addBtnPos, ImVec2(addBtnPos.x + addBtnSize.x, addBtnPos.y + addBtnSize.y),
+                           addBtnColor, 2.0f);
+    drawList->AddRect(addBtnPos, ImVec2(addBtnPos.x + addBtnSize.x, addBtnPos.y + addBtnSize.y),
+                     IM_COL32(70, 70, 70, 255), 2.0f);
     
-    // Draw button
-    ImU32 buttonColor = isHovered ? IM_COL32(70, 70, 70, 255) : IM_COL32(60, 60, 60, 255);
-    drawList->AddRectFilled(buttonPos, ImVec2(buttonPos.x + buttonSize.x, buttonPos.y + buttonSize.y), 
-                           buttonColor, 3.0f);
-    drawList->AddRect(buttonPos, ImVec2(buttonPos.x + buttonSize.x, buttonPos.y + buttonSize.y), 
-                     IM_COL32(100, 100, 100, 255), 3.0f, 0, 1.0f);
+    const char* addText = "+ Add Track";
+    ImVec2 addTextSize = ImGui::CalcTextSize(addText);
+    drawList->AddText(ImVec2(addBtnPos.x + (addBtnSize.x - addTextSize.x) / 2.0f,
+                             addBtnPos.y + (addBtnSize.y - addTextSize.y) / 2.0f),
+                     IM_COL32(150, 150, 150, 255), addText);
     
-    // Draw button text
-    ImVec2 textSize = ImGui::CalcTextSize("+ Add Track");
-    ImVec2 textPos = ImVec2(buttonPos.x + (buttonSize.x - textSize.x) / 2.0f, 
-                            buttonPos.y + (buttonSize.y - textSize.y) / 2.0f);
-    drawList->AddText(textPos, IM_COL32(200, 200, 200, 255), "+ Add Track");
-    
-    if (isHovered && ImGui::IsMouseClicked(0)) {
+    if (addHovered && ImGui::IsMouseClicked(0)) {
         Track newTrack;
+        newTrack.colorIndex = static_cast<int>(tracks_.size() % 16);
         newTrack.synth = std::make_shared<Synthesizer>(engine_->getSampleRate());
         newTrack.synth->setVolume(0.5f);
         newTrack.synth->setOscillators(newTrack.oscillators);
         tracks_.push_back(std::move(newTrack));
-        // Select the newly created track
         selectedTrackIndex_ = tracks_.size() - 1;
         markDirty();
     }
     
-    // Small dummy to advance cursor past button
-    ImGui::Dummy(ImVec2(columnWidth, buttonSize.y + 10.0f));
-    
-    // End columns
+    ImGui::Dummy(ImVec2(addColumnWidth, addBtnSize.y + 8.0f));
     ImGui::Columns(1);
     
     ImGui::End();
@@ -2447,6 +2673,91 @@ void MainWindow::renderTransportControls() {
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "%s", countText);
     }
     
+    // Master output meter (right side of transport)
+    ImGui::SameLine();
+    float meterStartX = windowWidth - 100.0f;
+    ImGui::SetCursorPosX(meterStartX);
+    
+    // Update peak hold
+    auto now = std::chrono::steady_clock::now();
+    double currentTime = std::chrono::duration<double>(now.time_since_epoch()).count();
+    
+    if (currentTime - masterPeakHoldTime_ > 1.5) {
+        masterPeakHoldL_ = std::max(0.0f, masterPeakHoldL_ - 0.01f);
+        masterPeakHoldR_ = std::max(0.0f, masterPeakHoldR_ - 0.01f);
+    }
+    
+    if (masterPeakL_ > masterPeakHoldL_) {
+        masterPeakHoldL_ = masterPeakL_;
+        masterPeakHoldTime_ = currentTime;
+    }
+    if (masterPeakR_ > masterPeakHoldR_) {
+        masterPeakHoldR_ = masterPeakR_;
+        masterPeakHoldTime_ = currentTime;
+    }
+    
+    // Draw stereo meter
+    ImVec2 meterPos = ImGui::GetCursorScreenPos();
+    float meterWidth = 80.0f;
+    float meterHeight = 12.0f;
+    float channelHeight = 5.0f;
+    float channelGap = 2.0f;
+    
+    // Background
+    drawList->AddRectFilled(meterPos, ImVec2(meterPos.x + meterWidth, meterPos.y + meterHeight),
+                           IM_COL32(18, 18, 18, 255), 2.0f);
+    
+    // Left channel
+    float levelL = std::min(1.0f, masterPeakL_);
+    float levelR = std::min(1.0f, masterPeakR_);
+    
+    // Gradient color based on level
+    auto getMeterColor = [](float level) -> ImU32 {
+        if (level > 0.9f) return IM_COL32(255, 50, 50, 255);    // Red (clipping)
+        if (level > 0.7f) return IM_COL32(255, 200, 0, 255);    // Yellow
+        return IM_COL32(132, 214, 79, 255);                      // Green
+    };
+    
+    // Left channel fill
+    if (levelL > 0.001f) {
+        drawList->AddRectFilled(
+            ImVec2(meterPos.x + 1, meterPos.y + 1),
+            ImVec2(meterPos.x + 1 + (meterWidth - 2) * levelL, meterPos.y + 1 + channelHeight),
+            getMeterColor(levelL), 1.0f);
+    }
+    
+    // Right channel fill
+    if (levelR > 0.001f) {
+        drawList->AddRectFilled(
+            ImVec2(meterPos.x + 1, meterPos.y + 1 + channelHeight + channelGap),
+            ImVec2(meterPos.x + 1 + (meterWidth - 2) * levelR, meterPos.y + 1 + channelHeight + channelGap + channelHeight),
+            getMeterColor(levelR), 1.0f);
+    }
+    
+    // Peak hold indicators
+    if (masterPeakHoldL_ > 0.01f) {
+        float peakX = meterPos.x + 1 + (meterWidth - 2) * masterPeakHoldL_;
+        drawList->AddLine(ImVec2(peakX, meterPos.y + 1),
+                         ImVec2(peakX, meterPos.y + 1 + channelHeight),
+                         IM_COL32(255, 255, 255, 200), 1.0f);
+    }
+    if (masterPeakHoldR_ > 0.01f) {
+        float peakX = meterPos.x + 1 + (meterWidth - 2) * masterPeakHoldR_;
+        drawList->AddLine(ImVec2(peakX, meterPos.y + 1 + channelHeight + channelGap),
+                         ImVec2(peakX, meterPos.y + 1 + channelHeight + channelGap + channelHeight),
+                         IM_COL32(255, 255, 255, 200), 1.0f);
+    }
+    
+    // Meter scale marks
+    float mark70 = meterPos.x + 1 + (meterWidth - 2) * 0.7f;
+    float mark90 = meterPos.x + 1 + (meterWidth - 2) * 0.9f;
+    drawList->AddLine(ImVec2(mark70, meterPos.y), ImVec2(mark70, meterPos.y + meterHeight),
+                     IM_COL32(60, 60, 60, 255), 1.0f);
+    drawList->AddLine(ImVec2(mark90, meterPos.y), ImVec2(mark90, meterPos.y + meterHeight),
+                     IM_COL32(80, 60, 60, 255), 1.0f);
+    
+    ImGui::Dummy(ImVec2(meterWidth, meterHeight));
+    
     ImGui::End();
 #endif
 }
@@ -2496,21 +2807,38 @@ void MainWindow::updateTimeline() {
 void MainWindow::renderTrackTimeline(size_t trackIndex) {
 #ifdef PAN_USE_GUI
     const float pixelsPerBeat = 50.0f;
-    const float timelineHeight = 120.0f;  // Height per track timeline - make it more visible
-    const float beatMarkerHeight = 25.0f;
+    const float timelineHeight = 64.0f;  // Match track header height
+    const float beatMarkerHeight = 18.0f;
+    
+    // Track color palette (same as renderTracks)
+    static const ImU32 trackColors[16] = {
+        IM_COL32(255, 94, 94, 255),   IM_COL32(255, 149, 0, 255),
+        IM_COL32(255, 212, 0, 255),   IM_COL32(132, 214, 79, 255),
+        IM_COL32(0, 199, 140, 255),   IM_COL32(51, 153, 219, 255),
+        IM_COL32(138, 103, 219, 255), IM_COL32(219, 103, 186, 255),
+        IM_COL32(255, 128, 128, 255), IM_COL32(255, 179, 102, 255),
+        IM_COL32(255, 230, 102, 255), IM_COL32(179, 230, 128, 255),
+        IM_COL32(102, 217, 191, 255), IM_COL32(128, 191, 230, 255),
+        IM_COL32(179, 153, 230, 255), IM_COL32(230, 153, 204, 255)
+    };
     
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     ImVec2 canvasPos = ImGui::GetCursorScreenPos();
     ImVec2 canvasSize = ImGui::GetContentRegionAvail();
-    canvasSize.x = std::max(canvasSize.x, 600.0f);  // Minimum width - make it wider
+    canvasSize.x = std::max(canvasSize.x, 600.0f);
     canvasSize.y = timelineHeight;
     
-    // Draw timeline background (z-order 1.5 - same as track header or slightly above)
-    // Use same color as track header for consistency
-    ImU32 bgColor = (trackIndex % 2 == 0) ? IM_COL32(70, 75, 80, 255) : IM_COL32(75, 80, 85, 255);
-    drawList->AddRectFilled(canvasPos, ImVec2(canvasPos.x + canvasSize.x, canvasPos.y + canvasSize.y), bgColor);
+    int trackColorIdx = tracks_[trackIndex].colorIndex % 16;
     
-    // Draw beat markers at top
+    // Dark timeline background
+    drawList->AddRectFilled(canvasPos, ImVec2(canvasPos.x + canvasSize.x, canvasPos.y + canvasSize.y),
+                           IM_COL32(22, 22, 22, 255));
+    
+    // Beat marker area (top)
+    drawList->AddRectFilled(canvasPos, ImVec2(canvasPos.x + canvasSize.x, canvasPos.y + beatMarkerHeight),
+                           IM_COL32(30, 30, 30, 255));
+    
+    // Draw beat markers
     float visibleBeats = canvasSize.x / pixelsPerBeat;
     float startBeat = std::floor(timelineScrollX_ / pixelsPerBeat);
     float endBeat = startBeat + visibleBeats + 1.0f;
@@ -2518,29 +2846,26 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
     for (float beat = startBeat; beat <= endBeat; beat += 1.0f) {
         float x = canvasPos.x + (beat * pixelsPerBeat) - timelineScrollX_;
         if (x >= canvasPos.x && x <= canvasPos.x + canvasSize.x) {
-            // Major beat marker
-            drawList->AddLine(
-                ImVec2(x, canvasPos.y),
-                ImVec2(x, canvasPos.y + beatMarkerHeight),
-                IM_COL32(150, 150, 150, 255)
-            );
+            bool isBar = (static_cast<int>(beat) % 4 == 0);
             
-            // Beat number (only show every 4 beats to avoid clutter)
-            if (static_cast<int>(beat) % 4 == 0) {
+            // Vertical line
+            ImU32 lineColor = isBar ? IM_COL32(70, 70, 70, 255) : IM_COL32(45, 45, 45, 255);
+            drawList->AddLine(ImVec2(x, canvasPos.y + beatMarkerHeight),
+                             ImVec2(x, canvasPos.y + canvasSize.y), lineColor);
+            
+            // Beat/bar number
+            if (isBar) {
                 char beatLabel[16];
-                snprintf(beatLabel, sizeof(beatLabel), "%.0f", beat);
-                drawList->AddText(ImVec2(x + 2, canvasPos.y + 2), IM_COL32(200, 200, 200, 255), beatLabel);
+                snprintf(beatLabel, sizeof(beatLabel), "%d", static_cast<int>(beat / 4.0f) + 1);
+                drawList->AddText(ImVec2(x + 3, canvasPos.y + 2), IM_COL32(100, 100, 100, 255), beatLabel);
             }
         }
     }
     
-    // Draw track lane background - use same color as track header
-    ImU32 laneColor = (trackIndex % 2 == 0) ? IM_COL32(35, 35, 35, 255) : IM_COL32(40, 40, 40, 255);
-    drawList->AddRectFilled(
-        ImVec2(canvasPos.x, canvasPos.y + beatMarkerHeight),
-        ImVec2(canvasPos.x + canvasSize.x, canvasPos.y + canvasSize.y),
-        laneColor
-    );
+    // Bottom border of beat marker area
+    drawList->AddLine(ImVec2(canvasPos.x, canvasPos.y + beatMarkerHeight),
+                     ImVec2(canvasPos.x + canvasSize.x, canvasPos.y + beatMarkerHeight),
+                     IM_COL32(55, 55, 55, 255));
     
     // For Track 1, the timeline area should match the header background color
     // The darker background will be drawn below Track 1, covering the area where Track 2 would be
@@ -2644,45 +2969,52 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
     float centerNote = (minNote + maxNote) / 2.0f;
     float visibleNoteRange = 24.0f;  // Show 24 semitones (2 octaves) centered around played notes
     
-    // Draw notes as rectangles
-    float laneHeight = canvasSize.y - beatMarkerHeight - 20.0f;
-    float pixelsPerNote = laneHeight / visibleNoteRange;  // Pixels per semitone
-    float noteHeight = std::max(12.0f, pixelsPerNote * 0.8f);  // 80% of space for note, 20% for gap
+    // Draw notes as rounded rectangles with track color
+    float laneHeight = canvasSize.y - beatMarkerHeight - 8.0f;
+    float pixelsPerNote = laneHeight / visibleNoteRange;
+    float noteDrawHeight = std::max(8.0f, pixelsPerNote * 0.85f);
+    
+    // Get track color for notes
+    ImU32 baseColor = trackColors[trackColorIdx];
+    int baseR = (baseColor >> 0) & 0xFF;
+    int baseG = (baseColor >> 8) & 0xFF;
+    int baseB = (baseColor >> 16) & 0xFF;
     
     for (const auto& note : notesToDraw) {
         float startX = canvasPos.x + (note.startBeat * pixelsPerBeat) - timelineScrollX_;
         float endX = canvasPos.x + (note.endBeat * pixelsPerBeat) - timelineScrollX_;
-        float noteWidth = endX - startX;
         
-        // Only draw if visible (minimum width of 2px for very short notes)
         if (endX >= canvasPos.x && startX <= canvasPos.x + canvasSize.x) {
-            // Map note number to vertical position, centered around the played notes
-            // Center note is in the middle of the lane, other notes are relative to it
             float noteOffsetFromCenter = centerNote - note.noteNum;
-            float noteY = canvasPos.y + beatMarkerHeight + 10.0f + (laneHeight / 2.0f) + (noteOffsetFromCenter * pixelsPerNote);
+            float noteY = canvasPos.y + beatMarkerHeight + 4.0f + (laneHeight / 2.0f) + (noteOffsetFromCenter * pixelsPerNote);
             
-            // Color based on note velocity (brighter = higher velocity)
-            uint8_t velocity = note.velocity;
-            ImU32 noteColor = IM_COL32(100 + velocity / 2, 150 + velocity / 3, 200 + velocity / 4, 255);
+            // Velocity affects brightness
+            float velocityFactor = 0.6f + (note.velocity / 127.0f) * 0.4f;
+            int r = static_cast<int>(baseR * velocityFactor);
+            int g = static_cast<int>(baseG * velocityFactor);
+            int b = static_cast<int>(baseB * velocityFactor);
             
-            // Draw rectangle for the note (ensure minimum width of 3px)
+            ImU32 noteColor = IM_COL32(r, g, b, 255);
+            
             float drawEndX = std::max(endX, startX + 3.0f);
+            
+            // Rounded note rectangle
             drawList->AddRectFilled(
                 ImVec2(startX, noteY),
-                ImVec2(drawEndX, noteY + noteHeight),
-                noteColor
+                ImVec2(drawEndX, noteY + noteDrawHeight),
+                noteColor, 2.0f
             );
-            // Add border for visibility
+            
+            // Subtle border
             drawList->AddRect(
                 ImVec2(startX, noteY),
-                ImVec2(drawEndX, noteY + noteHeight),
-                IM_COL32(255, 255, 255, 200),
-                0.0f, 0, 1.0f
+                ImVec2(drawEndX, noteY + noteDrawHeight),
+                IM_COL32(r/2, g/2, b/2, 200), 2.0f, 0, 1.0f
             );
         }
     }
     
-    // Draw playhead (vertical line) - draw AFTER background so it appears on top
+    // Draw playhead (vertical line with triangle head) - Ableton style
     float currentTimelinePos;
     {
         std::lock_guard<std::mutex> lock(timelineMutex_);
@@ -2690,12 +3022,20 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
     }
     float playheadX = canvasPos.x + (currentTimelinePos * pixelsPerBeat) - timelineScrollX_;
     if (playheadX >= canvasPos.x && playheadX <= canvasPos.x + canvasSize.x) {
-        // Use ivory color to match the color scheme: RGB(250, 250, 240)
+        // Playhead line (orange like Ableton)
+        ImU32 playheadColor = IM_COL32(255, 149, 0, 255);
         drawList->AddLine(
             ImVec2(playheadX, canvasPos.y),
             ImVec2(playheadX, canvasPos.y + canvasSize.y),
-            IM_COL32(250, 250, 240, 255),  // Ivory playhead
-            2.0f
+            playheadColor, 2.0f
+        );
+        
+        // Triangle head at top
+        drawList->AddTriangleFilled(
+            ImVec2(playheadX - 5, canvasPos.y),
+            ImVec2(playheadX + 5, canvasPos.y),
+            ImVec2(playheadX, canvasPos.y + 8),
+            playheadColor
         );
     }
     
@@ -3012,11 +3352,11 @@ void MainWindow::renderPianoRoll() {
     
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     
-    // Background
+    // Background - darker for Ableton style
     drawList->AddRectFilled(canvasPos, ImVec2(canvasPos.x + canvasSize.x, canvasPos.y + canvasSize.y), 
-                           IM_COL32(25, 25, 25, 255));
+                           IM_COL32(18, 18, 18, 255));
     
-    // Draw piano keys on the left
+    // Draw piano keys on the left with Ableton-style coloring
     for (int i = 0; i < totalNotes; ++i) {
         int noteNum = lowestNote + (totalNotes - 1 - i);
         int noteInOctave = noteNum % 12;
@@ -3025,22 +3365,32 @@ void MainWindow::renderPianoRoll() {
         // Black keys are darker
         bool isBlackKey = (noteInOctave == 1 || noteInOctave == 3 || noteInOctave == 6 || 
                           noteInOctave == 8 || noteInOctave == 10);
-        ImU32 keyColor = isBlackKey ? IM_COL32(40, 40, 40, 255) : IM_COL32(200, 200, 200, 255);
+        bool isC = (noteInOctave == 0);
+        
+        // Ableton-style: white keys are light gray, black keys are darker
+        ImU32 keyColor = isBlackKey ? IM_COL32(35, 35, 35, 255) : IM_COL32(60, 60, 60, 255);
+        ImU32 textColor = isBlackKey ? IM_COL32(100, 100, 100, 255) : IM_COL32(140, 140, 140, 255);
+        
+        // C notes get a slightly different background
+        if (isC) {
+            keyColor = IM_COL32(70, 70, 70, 255);
+        }
         
         drawList->AddRectFilled(ImVec2(canvasPos.x, y), 
                                ImVec2(canvasPos.x + pianoKeyWidth, y + noteHeight),
                                keyColor);
-        drawList->AddRect(ImVec2(canvasPos.x, y), 
-                         ImVec2(canvasPos.x + pianoKeyWidth, y + noteHeight),
-                         IM_COL32(100, 100, 100, 255));
         
-        // Draw note name on C notes
-        if (noteInOctave == 0) {
+        // Subtle separator between keys
+        drawList->AddLine(ImVec2(canvasPos.x, y + noteHeight - 1),
+                         ImVec2(canvasPos.x + pianoKeyWidth, y + noteHeight - 1),
+                         IM_COL32(25, 25, 25, 255));
+        
+        // Draw note name on C notes (larger, clearer)
+        if (isC) {
             char noteName[8];
             snprintf(noteName, sizeof(noteName), "C%d", noteNum / 12 - 1);
-            drawList->AddText(ImVec2(canvasPos.x + 5, y + 1), 
-                             isBlackKey ? IM_COL32(200, 200, 200, 255) : IM_COL32(0, 0, 0, 255), 
-                             noteName);
+            drawList->AddText(ImVec2(canvasPos.x + 4, y + 1), 
+                             IM_COL32(180, 180, 180, 255), noteName);
         }
     }
     
@@ -3066,7 +3416,37 @@ void MainWindow::renderPianoRoll() {
     float subdivisionPixels = subdivisionBeats * pixelsPerBeat;
     int totalSubdivisions = static_cast<int>(gridWidth / subdivisionPixels) + 2;
     
-    // Draw subdivision lines
+    // Draw horizontal lane backgrounds (alternating for octaves, Ableton-style)
+    for (int i = 0; i < totalNotes; ++i) {
+        int noteNum = lowestNote + (totalNotes - 1 - i);
+        int noteInOctave = noteNum % 12;
+        float y = canvasPos.y + i * noteHeight;
+        
+        // White keys get slightly lighter lanes
+        bool isBlackKey = (noteInOctave == 1 || noteInOctave == 3 || noteInOctave == 6 || 
+                          noteInOctave == 8 || noteInOctave == 10);
+        bool isC = (noteInOctave == 0);
+        
+        ImU32 laneColor;
+        if (isC) {
+            laneColor = IM_COL32(30, 30, 30, 255);  // C notes - slightly brighter
+        } else if (isBlackKey) {
+            laneColor = IM_COL32(22, 22, 22, 255);  // Black key lanes - darker
+        } else {
+            laneColor = IM_COL32(26, 26, 26, 255);  // White key lanes
+        }
+        
+        drawList->AddRectFilled(ImVec2(gridStart, y),
+                               ImVec2(gridStart + gridWidth, y + noteHeight),
+                               laneColor);
+        
+        // Subtle lane separator
+        drawList->AddLine(ImVec2(gridStart, y + noteHeight - 1),
+                         ImVec2(gridStart + gridWidth, y + noteHeight - 1),
+                         IM_COL32(35, 35, 35, 255));
+    }
+    
+    // Draw subdivision lines (vertical)
     for (int i = 0; i < totalSubdivisions; ++i) {
         float x = gridStart + i * subdivisionPixels;
         float beatPos = i * subdivisionBeats;
@@ -3079,16 +3459,16 @@ void MainWindow::renderPianoRoll() {
         float lineThickness;
         
         if (isBar) {
-            // Bar line (every 4 beats)
-            lineColor = IM_COL32(100, 100, 100, 255);
-            lineThickness = 2.0f;
+            // Bar line (every 4 beats) - brighter
+            lineColor = IM_COL32(80, 80, 80, 255);
+            lineThickness = 1.0f;
         } else if (isBeat) {
             // Beat line
-            lineColor = IM_COL32(80, 80, 80, 255);
-            lineThickness = 1.5f;
+            lineColor = IM_COL32(50, 50, 50, 255);
+            lineThickness = 1.0f;
         } else {
-            // Subdivision line
-            lineColor = IM_COL32(60, 60, 60, 255);
+            // Subdivision line - very subtle
+            lineColor = IM_COL32(38, 38, 38, 255);
             lineThickness = 1.0f;
         }
         
@@ -3100,7 +3480,7 @@ void MainWindow::renderPianoRoll() {
         if (isBar) {
             char beatLabel[8];
             snprintf(beatLabel, sizeof(beatLabel), "%d", static_cast<int>(beatPos / 4.0f) + 1);
-            drawList->AddText(ImVec2(x + 2, canvasPos.y + 2), IM_COL32(150, 150, 150, 255), beatLabel);
+            drawList->AddText(ImVec2(x + 4, canvasPos.y + 2), IM_COL32(100, 100, 100, 255), beatLabel);
         }
     }
     
@@ -3164,14 +3544,35 @@ void MainWindow::renderPianoRoll() {
         }
     }
     
-    // Draw all notes
+    // Get track color for notes (Ableton-style: notes inherit track color)
+    static const ImU32 trackColors[16] = {
+        IM_COL32(255, 94, 94, 255),   // Red
+        IM_COL32(255, 149, 0, 255),   // Orange  
+        IM_COL32(255, 212, 0, 255),   // Yellow
+        IM_COL32(132, 214, 79, 255),  // Lime
+        IM_COL32(0, 199, 140, 255),   // Teal
+        IM_COL32(51, 153, 219, 255),  // Blue
+        IM_COL32(138, 103, 219, 255), // Purple
+        IM_COL32(219, 103, 186, 255), // Pink
+        IM_COL32(255, 128, 128, 255), // Light red
+        IM_COL32(255, 179, 102, 255), // Peach
+        IM_COL32(255, 230, 102, 255), // Light yellow
+        IM_COL32(179, 230, 128, 255), // Light lime
+        IM_COL32(102, 217, 191, 255), // Light teal
+        IM_COL32(128, 191, 230, 255), // Light blue
+        IM_COL32(179, 153, 230, 255), // Light purple
+        IM_COL32(230, 153, 204, 255)  // Light pink
+    };
+    
+    int trackColorIdx = (selectedTrackIndex_ < tracks_.size()) ? tracks_[selectedTrackIndex_].colorIndex : 0;
+    ImU32 baseNoteColor = trackColors[trackColorIdx % 16];
+    
+    // Draw all notes with rounded corners
     for (const auto& note : noteRects) {
         if (note.noteNum >= lowestNote && note.noteNum < lowestNote + totalNotes) {
-            // Check if this note is selected and being dragged
             bool isSelected = selectedNotes_.find({note.clipIndex, note.eventIndex}) != selectedNotes_.end();
             bool isBeingDragged = isSelected && draggedNote_.isDragging;
             
-            // Calculate position (with drag offset if applicable)
             float displayStartBeat = note.startBeat;
             uint8_t displayNoteNum = note.noteNum;
             
@@ -3180,29 +3581,63 @@ void MainWindow::renderPianoRoll() {
                 displayNoteNum = std::clamp(static_cast<int>(note.noteNum) + draggedNote_.currentNoteDelta, 0, 127);
             }
             
-            // Check if display note is in visible range
             if (displayNoteNum >= lowestNote && displayNoteNum < lowestNote + totalNotes) {
                 int noteIndex = totalNotes - 1 - (displayNoteNum - lowestNote);
                 float noteY = canvasPos.y + noteIndex * noteHeight;
                 float noteX = gridStart + displayStartBeat * pixelsPerBeat;
                 float noteW = (note.endBeat - note.startBeat) * pixelsPerBeat;
                 
-                ImU32 noteColor = isSelected ? 
-                    IM_COL32(255, 200, 100, 255) :  // Orange for selected notes
-                    IM_COL32(100 + note.velocity / 2, 150 + note.velocity / 3, 200 + note.velocity / 4, 255);
+                // Velocity affects brightness (Ableton-style)
+                float velocityFactor = 0.6f + (note.velocity / 127.0f) * 0.4f;
                 
-                // If being dragged, make it slightly transparent
-                if (isBeingDragged) {
-                    noteColor = (noteColor & 0x00FFFFFF) | 0xCC000000;  // Set alpha to 0xCC (80%)
+                // Extract RGB from base color and apply velocity
+                int r = ((baseNoteColor >> 0) & 0xFF);
+                int g = ((baseNoteColor >> 8) & 0xFF);
+                int b = ((baseNoteColor >> 16) & 0xFF);
+                
+                r = static_cast<int>(r * velocityFactor);
+                g = static_cast<int>(g * velocityFactor);
+                b = static_cast<int>(b * velocityFactor);
+                
+                ImU32 noteColor = IM_COL32(r, g, b, 255);
+                
+                // Selected notes get white highlight
+                if (isSelected) {
+                    noteColor = IM_COL32(255, 255, 255, 255);
                 }
                 
-                drawList->AddRectFilled(ImVec2(noteX, noteY + 1), 
-                                       ImVec2(noteX + noteW, noteY + noteHeight - 1),
-                                       noteColor);
-                drawList->AddRect(ImVec2(noteX, noteY + 1), 
-                                 ImVec2(noteX + noteW, noteY + noteHeight - 1),
-                                 isSelected ? IM_COL32(255, 255, 100, 255) : IM_COL32(255, 255, 255, 200),
-                                 0.0f, 0, isSelected ? 2.0f : 1.0f);
+                // Dragged notes are semi-transparent
+                if (isBeingDragged) {
+                    noteColor = (noteColor & 0x00FFFFFF) | 0xB0000000;
+                }
+                
+                float cornerRadius = 2.0f;
+                float noteTop = noteY + 1.0f;
+                float noteBottom = noteY + noteHeight - 1.0f;
+                
+                // Note fill with rounded corners
+                drawList->AddRectFilled(ImVec2(noteX, noteTop), 
+                                       ImVec2(noteX + noteW, noteBottom),
+                                       noteColor, cornerRadius);
+                
+                // Subtle darker border for depth
+                ImU32 borderColor = isSelected ? 
+                    IM_COL32(200, 200, 200, 255) : 
+                    IM_COL32(r/2, g/2, b/2, 200);
+                drawList->AddRect(ImVec2(noteX, noteTop), 
+                                 ImVec2(noteX + noteW, noteBottom),
+                                 borderColor, cornerRadius, 0, 1.0f);
+                
+                // Top highlight for 3D effect (only on non-selected)
+                if (!isSelected && noteW > 4.0f) {
+                    ImU32 highlightColor = IM_COL32(
+                        std::min(255, r + 40),
+                        std::min(255, g + 40),
+                        std::min(255, b + 40), 150);
+                    drawList->AddLine(ImVec2(noteX + 1, noteTop + 1),
+                                     ImVec2(noteX + noteW - 1, noteTop + 1),
+                                     highlightColor);
+                }
             }
         }
     }
