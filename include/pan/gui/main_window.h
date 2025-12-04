@@ -56,11 +56,16 @@ struct Track {
 // Instrument preset definition
 struct InstrumentPreset {
     std::string name;
-    std::string category;  // e.g., "Synth", "Piano"
+    std::string category;  // e.g., "Synth", "Piano", "Bass", "Pad", "Atmosphere"
     std::vector<Oscillator> oscillators;  // Oscillator configuration
+    InstrumentEnvelope envelope;  // ADSR, pitch envelope, LFO settings
     
     InstrumentPreset(const std::string& n, const std::string& cat, const std::vector<Oscillator>& oscs)
         : name(n), category(cat), oscillators(oscs) {}
+    
+    InstrumentPreset(const std::string& n, const std::string& cat, const std::vector<Oscillator>& oscs, 
+                     const InstrumentEnvelope& env)
+        : name(n), category(cat), oscillators(oscs), envelope(env) {}
 };
 
 // Sample info for browser display
@@ -245,6 +250,8 @@ private:
     void renderMenuBar();
     void renderTransportControls();
     void renderComponentBox(size_t trackIndex, size_t oscIndex, Oscillator& osc);
+    void renderInstrumentPanel(size_t trackIndex);
+    void renderVelocityEditor(float canvasX, float canvasY, float canvasWidth, float canvasHeight);
     void renderEffectBox(size_t trackIndex, size_t effectIndex, std::shared_ptr<Effect> effect);
     void renderTrackTimeline(size_t trackIndex);
     void updateTimeline();

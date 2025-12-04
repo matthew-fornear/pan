@@ -2,6 +2,7 @@
 #include "pan/audio/reverb.h"
 #include "pan/audio/chorus.h"
 #include "pan/audio/distortion.h"
+#include "pan/audio/eq8.h"
 #include "pan/audio/sampler.h"
 #include <iostream>
 #include <filesystem>
@@ -543,7 +544,7 @@ bool MainWindow::initializeAudio() {
         
         // If playing, trigger MIDI events from clips
         if (isPlaying_) {
-            for (auto& track : tracks_) {
+        for (auto& track : tracks_) {
                 if (track.synth) {
                     // Play back all completed clips on this track
                     for (const auto& clip : track.clips) {
@@ -610,11 +611,11 @@ bool MainWindow::initializeAudio() {
                 
                 // Mix into output (only if track should play)
                 if (shouldPlay) {
-                    for (size_t ch = 0; ch < output.getNumChannels(); ++ch) {
-                        const float* trackSamples = trackBuffer.getReadPointer(ch);
-                        float* outputSamples = output.getWritePointer(ch);
-                        for (size_t i = 0; i < numFrames; ++i) {
-                            outputSamples[i] += trackSamples[i];
+                for (size_t ch = 0; ch < output.getNumChannels(); ++ch) {
+                    const float* trackSamples = trackBuffer.getReadPointer(ch);
+                    float* outputSamples = output.getWritePointer(ch);
+                    for (size_t i = 0; i < numFrames; ++i) {
+                        outputSamples[i] += trackSamples[i];
                         }
                     }
                 }
@@ -1228,6 +1229,31 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
             ImGui::TreePop();
         }
         
+        // EQ8 with presets
+        if (ImGui::TreeNode("EQ8")) {
+            const char* eq8Presets[] = { "Flat", "Bass Boost", "Presence", "Scooped", "Bright", "Warm", "Lo Cut" };
+            for (int i = 0; i < 7; ++i) {
+                ImGui::PushID(10300 + i);
+                if (ImGui::Button(eq8Presets[i], ImVec2(-1, 22))) {
+                    if (!tracks_.empty() && selectedTrackIndex_ < tracks_.size()) {
+                        double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                        auto newEQ8 = std::make_shared<EQ8>(sampleRate);
+                        newEQ8->loadPreset(static_cast<EQ8::Preset>(i));
+                        tracks_[selectedTrackIndex_].effects.push_back(newEQ8);
+                        markDirty();
+                    }
+                }
+                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                    int payload[2] = { 3, i }; // effectType=3 (EQ8), presetIdx=i
+                    ImGui::SetDragDropPayload("EFFECT_PRESET", payload, sizeof(payload));
+                    ImGui::Text("Add EQ8 - %s", eq8Presets[i]);
+                    ImGui::EndDragDropSource();
+                }
+                ImGui::PopID();
+            }
+            ImGui::TreePop();
+        }
+        
         ImGui::PopStyleColor(2);
     }
     
@@ -1324,7 +1350,7 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                 int colorIdx = tracks_[selectedTrackIndex_].colorIndex % 24;
                 drawList->AddCircleFilled(ImVec2(dotPos.x + 6, dotPos.y + 8), 5.0f, trackColors[colorIdx]);
                 ImGui::Dummy(ImVec2(16, 0));
-                ImGui::SameLine();
+                    ImGui::SameLine();
                 
                 // Track label with double-click rename support
                 char trackLabel[64];
@@ -1332,8 +1358,8 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                     snprintf(trackLabel, sizeof(trackLabel), "%s", tracks_[selectedTrackIndex_].name.c_str());
                 } else {
                     snprintf(trackLabel, sizeof(trackLabel), "Track %zu", selectedTrackIndex_ + 1);
-                }
-                
+            }
+            
                 // Check if renaming this track from components panel
                 if (renamingTrackIndex_ == static_cast<int>(selectedTrackIndex_)) {
                     ImGui::PushItemWidth(150);
@@ -1415,84 +1441,115 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                 ImGui::Separator();
                 ImGui::Spacing();
                 
-                // Render component boxes from selected track only
+                // Render Instrument Panel (which now contains oscillators in a sub-tab)
                 auto& oscillators = tracks_[selectedTrackIndex_].oscillators;
-                for (size_t oscIdx = 0; oscIdx < oscillators.size(); ++oscIdx) {
-                    ImGui::PushID(static_cast<int>(selectedTrackIndex_ * 1000 + oscIdx));
-                    renderComponentBox(selectedTrackIndex_, oscIdx, oscillators[oscIdx]);
-                    ImGui::PopID();
-                    ImGui::SameLine();
+                if (!oscillators.empty() || tracks_[selectedTrackIndex_].hasSampler) {
+                    renderInstrumentPanel(selectedTrackIndex_);
+                } else {
+                    // Empty state - show drag hint
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
+                    ImGui::Text("Drag an instrument from the browser to load");
+                    ImGui::PopStyleColor();
                 }
                 
                 // Render Simpler if track has sampler
                 if (tracks_[selectedTrackIndex_].hasSampler) {
                     ImGui::NewLine();
-                    ImGui::Spacing();
                     
-                    // Simpler box - Ableton style
-                    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
-                    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
-                    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.1f, 0.1f, 0.1f, 1.0f));
-                    
-                    float simplerWidth = ImGui::GetContentRegionAvail().x;
-                    float simplerHeight = 140.0f;
-                    
-                    ImGui::BeginChild("SimplerBox", ImVec2(simplerWidth, simplerHeight), true);
-                    
+                    // Ableton-style Sampler panel
                     ImDrawList* drawList = ImGui::GetWindowDrawList();
-                    ImVec2 boxPos = ImGui::GetWindowPos();
-                    float boxWidth = ImGui::GetContentRegionAvail().x;
+                    ImVec2 startPos = ImGui::GetCursorScreenPos();
+                    float panelWidth = ImGui::GetContentRegionAvail().x;
+                    float panelHeight = 180.0f;
                     
-                    // Header bar - blue when enabled
+                    // Gray panel background (like Ableton)
+                    ImU32 panelBg = IM_COL32(58, 58, 60, 255);
+                    ImU32 headerBg = IM_COL32(42, 42, 44, 255);
+                    ImU32 waveformBg = IM_COL32(25, 28, 32, 255);
+                    ImU32 textDim = IM_COL32(120, 120, 120, 255);
+                    ImU32 accentColor = IM_COL32(220, 150, 50, 255);
+                    
+                    drawList->AddRectFilled(startPos, ImVec2(startPos.x + panelWidth, startPos.y + panelHeight), panelBg);
+                    
+                    // Header bar
                     float headerHeight = 22.0f;
-                    drawList->AddRectFilled(boxPos, ImVec2(boxPos.x + boxWidth + 16.0f, boxPos.y + headerHeight),
-                                           IM_COL32(60, 90, 130, 255), 4.0f, ImDrawFlags_RoundCornersTop);
+                    drawList->AddRectFilled(startPos, ImVec2(startPos.x + panelWidth, startPos.y + headerHeight), headerBg);
                     
-                    // Title "Sampler"
-                    drawList->AddText(ImVec2(boxPos.x + 8.0f, boxPos.y + 4.0f), 
-                                     IM_COL32(255, 255, 255, 255), "Sampler");
+                    // Orange power indicator
+                    drawList->AddCircleFilled(ImVec2(startPos.x + 12, startPos.y + headerHeight/2), 5, accentColor);
                     
-                    // Power button (top right)
-                    ImVec2 powerPos = ImVec2(boxPos.x + boxWidth, boxPos.y + 5.0f);
-                    bool powerHovered = (ImGui::GetMousePos().x >= powerPos.x - 8 && 
-                                        ImGui::GetMousePos().x <= powerPos.x + 8 &&
-                                        ImGui::GetMousePos().y >= powerPos.y - 4 && 
-                                        ImGui::GetMousePos().y <= powerPos.y + 12);
-                    ImU32 powerColor = powerHovered ? IM_COL32(255, 200, 100, 255) : IM_COL32(200, 200, 200, 255);
-                    drawList->AddCircle(ImVec2(powerPos.x, powerPos.y + 6), 6.0f, powerColor, 12, 1.5f);
+                    // Sample name or "Sampler"
+                    std::string samplerTitle = "Sampler";
+                    if (!tracks_[selectedTrackIndex_].samplerSamplePath.empty()) {
+                        samplerTitle = std::filesystem::path(tracks_[selectedTrackIndex_].samplerSamplePath).stem().string();
+                    }
+                    drawList->AddText(ImVec2(startPos.x + 24, startPos.y + 4), IM_COL32(200, 200, 200, 255), samplerTitle.c_str());
                     
-                    if (powerHovered && ImGui::IsMouseClicked(0)) {
+                    // Tab buttons in header
+                    float tabX = startPos.x + 200;
+                    const char* tabs[] = {"Zone", "Sample", "Pitch/Osc", "Filter/Global", "Modulation"};
+                    static int activeSamplerTab = 1;
+                    
+                    for (int i = 0; i < 5; i++) {
+                        ImVec2 textSize = ImGui::CalcTextSize(tabs[i]);
+                        bool isActive = (activeSamplerTab == i);
+                        
+                        // Colored dot
+                        ImU32 dotColor = isActive ? accentColor : IM_COL32(80, 80, 80, 255);
+                        drawList->AddCircleFilled(ImVec2(tabX, startPos.y + headerHeight/2), 3, dotColor);
+                        tabX += 8;
+                        
+                        // Tab text
+                        drawList->AddText(ImVec2(tabX, startPos.y + 4), 
+                                         isActive ? IM_COL32(200, 200, 200, 255) : textDim, tabs[i]);
+                        
+                        // Click detection
+                        ImGui::SetCursorScreenPos(ImVec2(tabX - 8, startPos.y));
+                        ImGui::InvisibleButton(tabs[i], ImVec2(textSize.x + 16, headerHeight));
+                        if (ImGui::IsItemClicked()) activeSamplerTab = i;
+                        
+                        tabX += textSize.x + 16;
+                    }
+                    
+                    // Close button
+                    ImVec2 closePos = ImVec2(startPos.x + panelWidth - 20, startPos.y + 4);
+                    drawList->AddText(closePos, textDim, "x");
+                    ImGui::SetCursorScreenPos(closePos);
+                    ImGui::InvisibleButton("##closeSampler", ImVec2(16, 16));
+                    if (ImGui::IsItemClicked()) {
                         tracks_[selectedTrackIndex_].hasSampler = false;
                         markDirty();
                     }
                     
-                    // Skip past header
-                    ImGui::Dummy(ImVec2(0, headerHeight - 4));
-                    
                     // Waveform display area
-                    ImVec2 waveformPos = ImGui::GetCursorScreenPos();
-                    float waveformWidth = boxWidth;
+                    ImVec2 waveformPos = ImVec2(startPos.x + 4, startPos.y + headerHeight + 4);
+                    float waveformWidth = panelWidth - 8;
                     float waveformHeight = 80.0f;
                     
-                    // Waveform background
                     drawList->AddRectFilled(waveformPos, 
                                            ImVec2(waveformPos.x + waveformWidth, waveformPos.y + waveformHeight),
-                                           IM_COL32(25, 25, 30, 255), 2.0f);
+                                           waveformBg);
+                    drawList->AddRect(waveformPos, 
+                                     ImVec2(waveformPos.x + waveformWidth, waveformPos.y + waveformHeight),
+                                     IM_COL32(50, 80, 120, 255));
                     
-                    // Draw waveform if sample loaded
+                    // Draw ORANGE waveform if sample loaded (like Ableton)
                     if (!tracks_[selectedTrackIndex_].samplerWaveform.empty()) {
                         float centerY = waveformPos.y + waveformHeight / 2.0f;
                         float xStep = waveformWidth / tracks_[selectedTrackIndex_].samplerWaveform.size();
-                        ImU32 waveColor = IM_COL32(100, 180, 255, 200);
+                        ImU32 waveColor = IM_COL32(230, 160, 60, 255); // Orange like Ableton
                         
                         for (size_t j = 0; j < tracks_[selectedTrackIndex_].samplerWaveform.size(); ++j) {
                             float x = waveformPos.x + j * xStep;
                             float amp = tracks_[selectedTrackIndex_].samplerWaveform[j] * (waveformHeight / 2.0f - 4.0f);
                             drawList->AddLine(ImVec2(x, centerY - amp), ImVec2(x, centerY + amp), waveColor);
                         }
+                        
+                        // Time markers below waveform
+                        drawList->AddText(ImVec2(waveformPos.x + 4, waveformPos.y + waveformHeight - 14), textDim, "0:00");
+                        drawList->AddText(ImVec2(waveformPos.x + waveformWidth/2 - 15, waveformPos.y + waveformHeight - 14), textDim, "0:00:500");
+                        drawList->AddText(ImVec2(waveformPos.x + waveformWidth - 35, waveformPos.y + waveformHeight - 14), textDim, "0:01");
                     } else {
-                        // Empty state - "Drop sample here"
                         const char* dropText = "Drop sample here";
                         ImVec2 textSize = ImGui::CalcTextSize(dropText);
                         drawList->AddText(ImVec2(waveformPos.x + (waveformWidth - textSize.x) / 2.0f,
@@ -1500,9 +1557,9 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                                          IM_COL32(80, 80, 80, 255), dropText);
                     }
                     
-                    ImGui::Dummy(ImVec2(waveformWidth, waveformHeight));
-                    
-                    // Drop target for samples
+                    // Drop target for waveform area
+                    ImGui::SetCursorScreenPos(waveformPos);
+                    ImGui::InvisibleButton("##waveformDrop", ImVec2(waveformWidth, waveformHeight));
                     if (ImGui::BeginDragDropTarget()) {
                         if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("SAMPLE")) {
                             if (payload->DataSize == sizeof(size_t)) {
@@ -1518,15 +1575,56 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                         ImGui::EndDragDropTarget();
                     }
                     
-                    // Sample name if loaded
+                    // Control rows below waveform (like Ableton Sampler)
+                    ImVec2 controlsPos = ImVec2(startPos.x + 4, startPos.y + headerHeight + waveformHeight + 10);
+                    
+                    // Row 1 labels
+                    drawList->AddText(ImVec2(controlsPos.x, controlsPos.y), textDim, "Reverse");
+                    drawList->AddText(ImVec2(controlsPos.x + 60, controlsPos.y), textDim, "Sample");
+                    drawList->AddText(ImVec2(controlsPos.x + 200, controlsPos.y), textDim, "Vol");
+                    drawList->AddText(ImVec2(controlsPos.x + 260, controlsPos.y), textDim, "Sample Start");
+                    drawList->AddText(ImVec2(controlsPos.x + 360, controlsPos.y), textDim, "Sustain Mode");
+                    drawList->AddText(ImVec2(controlsPos.x + 460, controlsPos.y), textDim, "Loop Start");
+                    drawList->AddText(ImVec2(controlsPos.x + 540, controlsPos.y), textDim, "Loop End");
+                    
+                    // Row 1 values
+                    controlsPos.y += 14;
+                    drawList->AddText(ImVec2(controlsPos.x, controlsPos.y), IM_COL32(200, 200, 200, 255), "Off");
                     if (!tracks_[selectedTrackIndex_].samplerSamplePath.empty()) {
                         std::string sampleName = std::filesystem::path(tracks_[selectedTrackIndex_].samplerSamplePath).stem().string();
-                        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Sample: %s", sampleName.c_str());
+                        if (sampleName.length() > 15) sampleName = sampleName.substr(0, 15) + "...";
+                        drawList->AddText(ImVec2(controlsPos.x + 60, controlsPos.y), accentColor, sampleName.c_str());
                     }
+                    drawList->AddText(ImVec2(controlsPos.x + 200, controlsPos.y), accentColor, "0.0 dB");
+                    drawList->AddText(ImVec2(controlsPos.x + 260, controlsPos.y), accentColor, "0");
+                    drawList->AddText(ImVec2(controlsPos.x + 460, controlsPos.y), accentColor, "0");
+                    drawList->AddText(ImVec2(controlsPos.x + 540, controlsPos.y), accentColor, "50237");
                     
-                    ImGui::EndChild();
-                    ImGui::PopStyleColor(2);
-                    ImGui::PopStyleVar(2);
+                    // Row 2 labels
+                    controlsPos.y += 20;
+                    drawList->AddText(ImVec2(controlsPos.x, controlsPos.y), textDim, "Snap");
+                    drawList->AddText(ImVec2(controlsPos.x + 60, controlsPos.y), textDim, "Root");
+                    drawList->AddText(ImVec2(controlsPos.x + 110, controlsPos.y), textDim, "Detune");
+                    drawList->AddText(ImVec2(controlsPos.x + 170, controlsPos.y), textDim, "Scale");
+                    drawList->AddText(ImVec2(controlsPos.x + 220, controlsPos.y), textDim, "Pan");
+                    drawList->AddText(ImVec2(controlsPos.x + 260, controlsPos.y), textDim, "Sample End");
+                    drawList->AddText(ImVec2(controlsPos.x + 360, controlsPos.y), textDim, "Release Mode");
+                    
+                    // Row 2 values
+                    controlsPos.y += 14;
+                    drawList->AddText(ImVec2(controlsPos.x, controlsPos.y), IM_COL32(200, 200, 200, 255), "Off");
+                    drawList->AddText(ImVec2(controlsPos.x + 60, controlsPos.y), IM_COL32(80, 180, 220, 255), "C0");
+                    drawList->AddText(ImVec2(controlsPos.x + 110, controlsPos.y), accentColor, "0 ct");
+                    drawList->AddText(ImVec2(controlsPos.x + 170, controlsPos.y), accentColor, "100 %");
+                    drawList->AddText(ImVec2(controlsPos.x + 220, controlsPos.y), accentColor, "C");
+                    drawList->AddText(ImVec2(controlsPos.x + 260, controlsPos.y), accentColor, "50237");
+                    drawList->AddText(ImVec2(controlsPos.x + 360, controlsPos.y), IM_COL32(200, 200, 200, 255), "Off");
+                    
+                    // RAM indicator
+                    drawList->AddText(ImVec2(startPos.x + panelWidth - 40, controlsPos.y), IM_COL32(80, 180, 220, 255), "RAM");
+                    
+                    ImGui::SetCursorScreenPos(ImVec2(startPos.x, startPos.y + panelHeight));
+                    ImGui::Dummy(ImVec2(panelWidth, 1));
                 }
             } else {
                 ImGui::Text("No tracks available");
@@ -1562,6 +1660,8 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                             // Replace all oscillators with the preset's oscillators
                             tracks_[selectedTrackIndex_].oscillators = preset.oscillators;
                             tracks_[selectedTrackIndex_].synth->setOscillators(tracks_[selectedTrackIndex_].oscillators);
+                            // Apply envelope settings
+                            tracks_[selectedTrackIndex_].synth->setEnvelope(preset.envelope);
                             tracks_[selectedTrackIndex_].waveformSet = true;
                             tracks_[selectedTrackIndex_].instrumentName = preset.name;
                             markDirty();
@@ -1578,6 +1678,7 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                             // Replace all oscillators with the preset's oscillators
                             tracks_[selectedTrackIndex_].oscillators = preset.oscillators;
                             tracks_[selectedTrackIndex_].synth->setOscillators(tracks_[selectedTrackIndex_].oscillators);
+                            tracks_[selectedTrackIndex_].synth->setEnvelope(preset.envelope);  // Apply envelope
                             tracks_[selectedTrackIndex_].waveformSet = true;
                             tracks_[selectedTrackIndex_].instrumentName = preset.name;
                             markDirty();
@@ -1694,6 +1795,12 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                                     newEffect = distortion;
                                     break;
                                 }
+                                case 3: {
+                                    auto eq8 = std::make_shared<EQ8>(sampleRate);
+                                    eq8->loadPreset(static_cast<EQ8::Preset>(presetIdx));
+                                    newEffect = eq8;
+                                    break;
+                                }
                             }
                             
                             if (newEffect && selectedTrackIndex_ < tracks_.size()) {
@@ -1762,15 +1869,15 @@ void MainWindow::renderComponentBox(size_t trackIndex, size_t oscIndex, Oscillat
         drawList->AddText(closePos, IM_COL32(120, 120, 120, 255), "x");
         
         if (closeHovered && ImGui::IsMouseClicked(0)) {
-            oscillators.erase(oscillators.begin() + oscIndex);
-            tracks_[trackIndex].synth->setOscillators(oscillators);
+        oscillators.erase(oscillators.begin() + oscIndex);
+        tracks_[trackIndex].synth->setOscillators(oscillators);
             markDirty();
-            ImGui::EndChild();
+        ImGui::EndChild();
             ImGui::PopStyleVar(2);
             ImGui::PopStyleColor(2);
-            ImGui::PopID();
-            return;
-        }
+        ImGui::PopID();
+        return;
+    }
     }
     
     // Skip past header
@@ -1821,6 +1928,313 @@ void MainWindow::renderComponentBox(size_t trackIndex, size_t oscIndex, Oscillat
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(2);
     ImGui::PopID();
+#endif
+}
+
+// Interactive envelope display - returns true if envelope was modified
+static bool DrawInteractiveEnvelope(ImDrawList* drawList, ImVec2 pos, float width, float height,
+                                    float& attack, float& decay, float& sustain, float& release) {
+    bool modified = false;
+    static int draggingPoint = -1; // 0=attack, 1=decay/sustain, 2=release
+    
+    // Background
+    drawList->AddRectFilled(pos, ImVec2(pos.x + width, pos.y + height), IM_COL32(20, 25, 30, 255));
+    drawList->AddRect(pos, ImVec2(pos.x + width, pos.y + height), IM_COL32(50, 80, 120, 255));
+    
+    // Grid lines
+    for (int i = 1; i < 4; i++) {
+        float y = pos.y + height * i / 4.0f;
+        drawList->AddLine(ImVec2(pos.x, y), ImVec2(pos.x + width, y), IM_COL32(35, 45, 55, 60));
+    }
+    
+    // Fixed time scale for better visualization
+    float maxTime = 3.0f; // 3 seconds total view
+    float sustainPhase = 0.4f; // sustain phase duration in view
+    float scale = width / maxTime;
+    
+    // Calculate envelope points
+    float x0 = pos.x + 2;
+    float y0 = pos.y + height - 2;
+    float x1 = pos.x + std::min(attack, maxTime * 0.3f) * scale;
+    float y1 = pos.y + 4;
+    float x2 = x1 + std::min(decay, maxTime * 0.3f) * scale;
+    float y2 = pos.y + height * (1.0f - sustain) + 4;
+    float x3 = x2 + sustainPhase * scale;
+    float y3 = y2;
+    float x4 = std::min(x3 + std::min(release, maxTime * 0.4f) * scale, pos.x + width - 2);
+    float y4 = pos.y + height - 4;
+    
+    // Draw envelope curve
+    ImU32 envColor = IM_COL32(80, 180, 220, 255);
+    ImU32 envColorDim = IM_COL32(60, 140, 180, 200);
+    drawList->AddLine(ImVec2(x0, y0), ImVec2(x1, y1), envColor, 2.0f);
+    drawList->AddLine(ImVec2(x1, y1), ImVec2(x2, y2), envColor, 2.0f);
+    drawList->AddLine(ImVec2(x2, y2), ImVec2(x3, y3), envColorDim, 2.0f);
+    drawList->AddLine(ImVec2(x3, y3), ImVec2(x4, y4), envColor, 2.0f);
+    
+    // Interactive points
+    ImVec2 mousePos = ImGui::GetMousePos();
+    bool mouseInArea = mousePos.x >= pos.x && mousePos.x <= pos.x + width &&
+                       mousePos.y >= pos.y && mousePos.y <= pos.y + height;
+    
+    // Point 1: Attack (controls attack time)
+    ImVec2 p1 = ImVec2(x1, y1);
+    bool hover1 = (mousePos.x >= p1.x - 8 && mousePos.x <= p1.x + 8 && 
+                   mousePos.y >= p1.y - 8 && mousePos.y <= p1.y + 8);
+    drawList->AddCircleFilled(p1, hover1 ? 6 : 4, hover1 ? IM_COL32(255, 200, 100, 255) : envColor);
+    
+    // Point 2: Decay/Sustain (controls decay time and sustain level)
+    ImVec2 p2 = ImVec2(x2, y2);
+    bool hover2 = (mousePos.x >= p2.x - 8 && mousePos.x <= p2.x + 8 && 
+                   mousePos.y >= p2.y - 8 && mousePos.y <= p2.y + 8);
+    drawList->AddCircleFilled(p2, hover2 ? 6 : 4, hover2 ? IM_COL32(255, 200, 100, 255) : envColor);
+    
+    // Point 3: Release (controls release time)
+    ImVec2 p3 = ImVec2(x4, y4);
+    bool hover3 = (mousePos.x >= p3.x - 8 && mousePos.x <= p3.x + 8 && 
+                   mousePos.y >= p3.y - 8 && mousePos.y <= p3.y + 8);
+    drawList->AddCircleFilled(p3, hover3 ? 6 : 4, hover3 ? IM_COL32(255, 200, 100, 255) : envColor);
+    
+    // Handle dragging
+    if (ImGui::IsMouseClicked(0) && mouseInArea) {
+        if (hover1) draggingPoint = 0;
+        else if (hover2) draggingPoint = 1;
+        else if (hover3) draggingPoint = 2;
+    }
+    
+    if (!ImGui::IsMouseDown(0)) {
+        draggingPoint = -1;
+    }
+    
+    if (draggingPoint >= 0 && ImGui::IsMouseDragging(0)) {
+        ImVec2 delta = ImGui::GetIO().MouseDelta;
+        
+        if (draggingPoint == 0) {
+            // Attack: horizontal = time
+            attack = std::clamp(attack + delta.x / scale, 0.001f, 2.0f);
+            modified = true;
+        } else if (draggingPoint == 1) {
+            // Decay/Sustain: horizontal = decay time, vertical = sustain level
+            decay = std::clamp(decay + delta.x / scale, 0.001f, 2.0f);
+            sustain = std::clamp(sustain - delta.y / height, 0.0f, 1.0f);
+            modified = true;
+        } else if (draggingPoint == 2) {
+            // Release: horizontal = time
+            release = std::clamp(release + delta.x / scale, 0.001f, 5.0f);
+            modified = true;
+        }
+    }
+    
+    // Labels on envelope
+    char buf[16];
+    snprintf(buf, sizeof(buf), "A:%.0fms", attack * 1000);
+    drawList->AddText(ImVec2(pos.x + 4, pos.y + 2), IM_COL32(100, 100, 100, 255), buf);
+    snprintf(buf, sizeof(buf), "S:%.0f%%", sustain * 100);
+    drawList->AddText(ImVec2(x2 + 4, y2 - 12), IM_COL32(100, 100, 100, 255), buf);
+    
+    return modified;
+}
+
+void MainWindow::renderInstrumentPanel(size_t trackIndex) {
+#ifdef PAN_USE_GUI
+    if (trackIndex >= tracks_.size() || !tracks_[trackIndex].synth) return;
+    
+    auto& synth = tracks_[trackIndex].synth;
+    auto& env = synth->getEnvelope();
+    auto& oscillators = tracks_[trackIndex].oscillators;
+    
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    ImVec2 startPos = ImGui::GetCursorScreenPos();
+    float panelWidth = ImGui::GetContentRegionAvail().x;
+    float panelHeight = std::min(ImGui::GetContentRegionAvail().y, 160.0f); // Compact height
+    
+    // Colors
+    ImU32 panelBg = IM_COL32(52, 52, 54, 255);
+    ImU32 sectionBg = IM_COL32(42, 42, 44, 255);
+    ImU32 headerBg = IM_COL32(38, 38, 40, 255);
+    ImU32 textDim = IM_COL32(110, 110, 110, 255);
+    ImU32 textBright = IM_COL32(190, 190, 190, 255);
+    ImU32 accentColor = IM_COL32(220, 130, 50, 255);
+    
+    drawList->AddRectFilled(startPos, ImVec2(startPos.x + panelWidth, startPos.y + panelHeight), panelBg);
+    
+    // Compact header bar
+    float headerHeight = 20.0f;
+    drawList->AddRectFilled(startPos, ImVec2(startPos.x + panelWidth, startPos.y + headerHeight), headerBg);
+    
+    // Power indicator + name
+    drawList->AddCircleFilled(ImVec2(startPos.x + 10, startPos.y + headerHeight/2), 4, accentColor);
+    std::string title = tracks_[trackIndex].instrumentName.empty() ? "Synth" : tracks_[trackIndex].instrumentName;
+    drawList->AddText(ImVec2(startPos.x + 20, startPos.y + 3), textBright, title.c_str());
+    
+    // Quick controls in header
+    float hdrX = startPos.x + 150;
+    
+    // Filter toggle
+    ImGui::SetCursorScreenPos(ImVec2(hdrX, startPos.y + 2));
+    ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.9f, 0.5f, 0.2f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2, 2));
+    bool filtOn = env.filter.enabled;
+    if (ImGui::Checkbox("Flt", &filtOn)) env.filter.enabled = filtOn;
+    ImGui::SameLine();
+    bool lfoOn = env.lfo1.enabled;
+    if (ImGui::Checkbox("LFO", &lfoOn)) env.lfo1.enabled = lfoOn;
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+    
+    // Content area
+    ImVec2 contentPos = ImVec2(startPos.x + 2, startPos.y + headerHeight + 2);
+    float contentHeight = panelHeight - headerHeight - 4;
+    
+    // === COMPACT LAYOUT: Oscillators | Envelope | Controls ===
+    
+    // Left: Oscillator mini-panels (stacked vertically, very compact)
+    float oscWidth = 100.0f;
+    float oscRowH = contentHeight / std::max((int)oscillators.size(), 2);
+    
+    for (int op = 0; op < (int)oscillators.size() && op < 4; op++) {
+        ImVec2 opPos = ImVec2(contentPos.x, contentPos.y + op * oscRowH);
+        drawList->AddRectFilled(opPos, ImVec2(opPos.x + oscWidth, opPos.y + oscRowH - 1), sectionBg, 2.0f);
+        
+        ImGui::SetCursorScreenPos(ImVec2(opPos.x + 2, opPos.y + 2));
+        ImGui::PushID(op * 100);
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.17f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.55f, 0.2f, 1.0f));
+        ImGui::PushItemWidth(40);
+        
+        float freq = oscillators[op].frequencyMultiplier;
+        if (ImGui::DragFloat("##f", &freq, 0.1f, 0.1f, 16.0f, "%.1f")) {
+            oscillators[op].frequencyMultiplier = freq;
+        }
+        ImGui::SameLine();
+        float amp = oscillators[op].amplitude;
+        if (ImGui::DragFloat("##a", &amp, 0.01f, 0.0f, 1.0f, "%.2f")) {
+            oscillators[op].amplitude = amp;
+        }
+        
+        // Mini level bar
+        float barH = oscRowH - 6;
+        float barFill = amp * barH;
+        drawList->AddRectFilled(ImVec2(opPos.x + oscWidth - 8, opPos.y + 2 + barH - barFill),
+                               ImVec2(opPos.x + oscWidth - 3, opPos.y + 2 + barH),
+                               IM_COL32(200, 90, 60, 255));
+        
+        ImGui::PopItemWidth();
+        ImGui::PopStyleColor(2);
+        ImGui::PopID();
+    }
+    
+    // Center: Interactive Envelope
+    float envX = contentPos.x + oscWidth + 4;
+    float envWidth = panelWidth - oscWidth - 200;
+    float envHeight = contentHeight - 34;
+    
+    // Draw interactive envelope
+    DrawInteractiveEnvelope(drawList, ImVec2(envX, contentPos.y), envWidth, envHeight,
+                           env.ampEnvelope.attack, env.ampEnvelope.decay,
+                           env.ampEnvelope.sustain, env.ampEnvelope.release);
+    
+    // Parameter inputs below envelope (compact row)
+    ImGui::SetCursorScreenPos(ImVec2(envX, contentPos.y + envHeight + 2));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.17f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.55f, 0.2f, 1.0f));
+    ImGui::PushItemWidth(50);
+    
+    float attackMs = env.ampEnvelope.attack * 1000;
+    if (ImGui::DragFloat("A", &attackMs, 1.0f, 0.0f, 5000.0f, "%.0f")) {
+        env.ampEnvelope.attack = attackMs / 1000.0f;
+    }
+    ImGui::SameLine();
+    float decayMs = env.ampEnvelope.decay * 1000;
+    if (ImGui::DragFloat("D", &decayMs, 1.0f, 0.0f, 5000.0f, "%.0f")) {
+        env.ampEnvelope.decay = decayMs / 1000.0f;
+    }
+    ImGui::SameLine();
+    float sus = env.ampEnvelope.sustain * 100;
+    if (ImGui::DragFloat("S", &sus, 1.0f, 0.0f, 100.0f, "%.0f%%")) {
+        env.ampEnvelope.sustain = sus / 100.0f;
+    }
+    ImGui::SameLine();
+    float releaseMs = env.ampEnvelope.release * 1000;
+    if (ImGui::DragFloat("R", &releaseMs, 1.0f, 0.0f, 10000.0f, "%.0f")) {
+        env.ampEnvelope.release = releaseMs / 1000.0f;
+    }
+    ImGui::PopItemWidth();
+    ImGui::PopStyleColor(2);
+    
+    // Right: Filter/LFO controls (compact vertical stack)
+    float rightX = startPos.x + panelWidth - 190;
+    float ctrlH = contentHeight / 3.0f;
+    
+    // Filter section
+    ImVec2 filtPos = ImVec2(rightX, contentPos.y);
+    drawList->AddRectFilled(filtPos, ImVec2(filtPos.x + 185, filtPos.y + ctrlH - 1), sectionBg, 2.0f);
+    drawList->AddCircleFilled(ImVec2(filtPos.x + 6, filtPos.y + 8), 3, env.filter.enabled ? accentColor : IM_COL32(60, 60, 60, 255));
+    drawList->AddText(ImVec2(filtPos.x + 12, filtPos.y + 2), textDim, "Filter");
+    
+    ImGui::SetCursorScreenPos(ImVec2(filtPos.x + 50, filtPos.y + 2));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.17f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.55f, 0.2f, 1.0f));
+    ImGui::PushItemWidth(45);
+    float freq = env.filter.cutoff * 20000;
+    if (ImGui::DragFloat("Hz", &freq, 10.0f, 20.0f, 20000.0f, "%.0f")) {
+        env.filter.cutoff = freq / 20000.0f;
+    }
+    ImGui::SameLine();
+    float res = env.filter.resonance * 100;
+    if (ImGui::DragFloat("Q", &res, 1.0f, 0.0f, 100.0f, "%.0f")) {
+        env.filter.resonance = res / 100.0f;
+    }
+    ImGui::PopItemWidth();
+    ImGui::PopStyleColor(2);
+    
+    // LFO section
+    ImVec2 lfoPos = ImVec2(rightX, contentPos.y + ctrlH);
+    drawList->AddRectFilled(lfoPos, ImVec2(lfoPos.x + 185, lfoPos.y + ctrlH - 1), sectionBg, 2.0f);
+    drawList->AddCircleFilled(ImVec2(lfoPos.x + 6, lfoPos.y + 8), 3, env.lfo1.enabled ? accentColor : IM_COL32(60, 60, 60, 255));
+    drawList->AddText(ImVec2(lfoPos.x + 12, lfoPos.y + 2), textDim, "LFO");
+    
+    ImGui::SetCursorScreenPos(ImVec2(lfoPos.x + 40, lfoPos.y + 2));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.17f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.55f, 0.2f, 1.0f));
+    ImGui::PushItemWidth(40);
+    float rate = env.lfo1.rate;
+    if (ImGui::DragFloat("Rt", &rate, 0.1f, 0.01f, 50.0f, "%.1f")) {
+        env.lfo1.rate = rate;
+    }
+    ImGui::SameLine();
+    float depth = env.lfo1.depth * 100;
+    if (ImGui::DragFloat("Dp", &depth, 1.0f, 0.0f, 100.0f, "%.0f")) {
+        env.lfo1.depth = depth / 100.0f;
+    }
+    ImGui::PopItemWidth();
+    ImGui::PopStyleColor(2);
+    
+    // Pitch section
+    ImVec2 pitchPos = ImVec2(rightX, contentPos.y + ctrlH * 2);
+    drawList->AddRectFilled(pitchPos, ImVec2(pitchPos.x + 185, pitchPos.y + ctrlH - 1), sectionBg, 2.0f);
+    drawList->AddCircleFilled(ImVec2(pitchPos.x + 6, pitchPos.y + 8), 3, env.pitchEnvelope.enabled ? accentColor : IM_COL32(60, 60, 60, 255));
+    drawList->AddText(ImVec2(pitchPos.x + 12, pitchPos.y + 2), textDim, "Pitch");
+    
+    ImGui::SetCursorScreenPos(ImVec2(pitchPos.x + 45, pitchPos.y + 2));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.17f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.55f, 0.2f, 1.0f));
+    ImGui::PushItemWidth(40);
+    float pamt = (env.pitchEnvelope.startMultiplier - 1.0f) * 100;
+    if (ImGui::DragFloat("St", &pamt, 1.0f, -100.0f, 300.0f, "%.0f")) {
+        env.pitchEnvelope.startMultiplier = 1.0f + pamt / 100.0f;
+    }
+    ImGui::SameLine();
+    float pdec = env.pitchEnvelope.decayTime * 1000;
+    if (ImGui::DragFloat("Tm", &pdec, 1.0f, 1.0f, 500.0f, "%.0f")) {
+        env.pitchEnvelope.decayTime = pdec / 1000.0f;
+    }
+    ImGui::PopItemWidth();
+    ImGui::PopStyleColor(2);
+    
+    // Move cursor past the panel and add Dummy to extend bounds
+    ImGui::SetCursorScreenPos(ImVec2(startPos.x, startPos.y + panelHeight + 4));
+    ImGui::Dummy(ImVec2(panelWidth, 1));
 #endif
 }
 
@@ -2162,7 +2576,7 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
         // Track header background
         ImU32 trackBg = isSelected ? IM_COL32(50, 50, 50, 255) : IM_COL32(35, 35, 35, 255);
         drawList->AddRectFilled(headerStartPos, 
-                               ImVec2(headerStartPos.x + columnWidth, headerStartPos.y + headerHeight),
+            ImVec2(headerStartPos.x + columnWidth, headerStartPos.y + headerHeight),
                                trackBg);
         
         // Color bar on left edge
@@ -2198,7 +2612,7 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
         } else if (!tracks_[i].instrumentName.empty()) {
             snprintf(trackLabel, sizeof(trackLabel), "Track %zu - %s", i + 1, tracks_[i].instrumentName.c_str());
         } else {
-            snprintf(trackLabel, sizeof(trackLabel), "Track %zu", i + 1);
+        snprintf(trackLabel, sizeof(trackLabel), "Track %zu", i + 1);
         }
         
         // Label bounds for double-click detection
@@ -2255,7 +2669,7 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
             }
             drawList->AddText(ImVec2(labelX, labelY), 
                              IM_COL32(200, 200, 200, 255), trackLabel);
-            
+        
             // Double-click to rename
             if (labelHovered && ImGui::IsMouseDoubleClicked(0)) {
                 renamingTrackIndex_ = static_cast<int>(i);
@@ -2558,6 +2972,7 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
                         const auto& preset = instrumentPresets_[presetIndex];
                         tracks_[i].oscillators = preset.oscillators;
                         tracks_[i].synth->setOscillators(tracks_[i].oscillators);
+                        tracks_[i].synth->setEnvelope(preset.envelope);  // Apply envelope
                         tracks_[i].waveformSet = true;
                         tracks_[i].instrumentName = preset.name;
                         selectedTrackIndex_ = i;
@@ -2572,6 +2987,7 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
                         const auto& preset = userPresets_[presetIndex];
                         tracks_[i].oscillators = preset.oscillators;
                         tracks_[i].synth->setOscillators(tracks_[i].oscillators);
+                        tracks_[i].synth->setEnvelope(preset.envelope);  // Apply envelope
                         tracks_[i].waveformSet = true;
                         tracks_[i].instrumentName = preset.name;
                         selectedTrackIndex_ = i;
@@ -2605,6 +3021,12 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
                             auto distortion = std::make_shared<Distortion>(sampleRate);
                             distortion->loadPreset(static_cast<Distortion::Preset>(presetIdx));
                             newEffect = distortion;
+                            break;
+                        }
+                        case 3: {
+                            auto eq8 = std::make_shared<EQ8>(sampleRate);
+                            eq8->loadPreset(static_cast<EQ8::Preset>(presetIdx));
+                            newEffect = eq8;
                             break;
                         }
                     }
@@ -2669,7 +3091,7 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
         ImGui::NextColumn();
         ImVec2 timelinePos = ImGui::GetCursorScreenPos();
         float timelineWidth = ImGui::GetContentRegionAvail().x;
-        
+    
         // Dark background
         drawList->AddRectFilled(timelinePos,
                                ImVec2(timelinePos.x + timelineWidth, timelinePos.y + remainingHeight),
@@ -2850,7 +3272,7 @@ void MainWindow::renderMenuBar() {
                     showUnsavedDialog = true;
                     pendingAction = PendingAction::Quit;
                 } else {
-                    shouldQuit_ = true;
+                shouldQuit_ = true;
                 }
             }
             ImGui::EndMenu();
@@ -3432,17 +3854,17 @@ void MainWindow::renderTransportControls() {
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
             
             if (ImGui::IsMouseDoubleClicked(0)) {
-                // Double-click to edit
-                snprintf(bpmInput, sizeof(bpmInput), "%.0f", bpm_);
-                bpmEditing = true;
+            // Double-click to edit
+            snprintf(bpmInput, sizeof(bpmInput), "%.0f", bpm_);
+            bpmEditing = true;
             } else {
-                // Scroll to change BPM
-                float scroll = ImGui::GetIO().MouseWheel;
-                if (scroll != 0.0f) {
-                    bpm_ = std::clamp(bpm_ + scroll, 1.0f, 300.0f);
+            // Scroll to change BPM
+            float scroll = ImGui::GetIO().MouseWheel;
+            if (scroll != 0.0f) {
+                bpm_ = std::clamp(bpm_ + scroll, 1.0f, 300.0f);
                     markDirty();
-                }
             }
+        }
         }
     }
     ImGui::PopID();
@@ -3485,7 +3907,7 @@ void MainWindow::renderTransportControls() {
             }
         } else {
             // Normal playback without count-in
-            isPlaying_ = true;
+        isPlaying_ = true;
             
             // Reset playback position to timeline position (in samples)
             double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
@@ -3497,22 +3919,22 @@ void MainWindow::renderTransportControls() {
             }
             playbackSamplePosition_ = static_cast<int64_t>(currentTimelinePos / beatsPerSecond * sampleRate);
             
-            if (masterRecord_) {
-                // Start recording - reset timeline position when play starts
-                {
-                    std::lock_guard<std::mutex> lock(timelineMutex_);
-                    timelinePosition_ = 0.0f;
-                }
-                timelineScrollX_ = 0.0f;
+        if (masterRecord_) {
+            // Start recording - reset timeline position when play starts
+            {
+                std::lock_guard<std::mutex> lock(timelineMutex_);
+                timelinePosition_ = 0.0f;
+            }
+            timelineScrollX_ = 0.0f;
                 playbackSamplePosition_ = 0;
-                
-                // Create recording clips for all hot tracks
-                for (auto& track : tracks_) {
-                    if (track.isRecording) {
-                        track.recordingClip = std::make_shared<MidiClip>("Recording");
-                        track.recordingClip->setStartTime(0);
-                    }
+            
+            // Create recording clips for all hot tracks
+            for (auto& track : tracks_) {
+                if (track.isRecording) {
+                    track.recordingClip = std::make_shared<MidiClip>("Recording");
+                    track.recordingClip->setStartTime(0);
                 }
+            }
             }
         }
     }
@@ -3938,7 +4360,7 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
         {
             std::lock_guard<std::mutex> lock(timelineMutex_);
             currentTimelinePos = timelinePosition_;
-        }
+                }
         for (const auto& [noteNum, noteData] : activeNotes) {
             notesToDraw.push_back({
                 noteNum,
@@ -4388,9 +4810,14 @@ void MainWindow::renderPianoRoll() {
     const int totalNotes = numOctaves * 12;  // 48 notes (4 octaves)
     const int lowestNote = std::max(0, pianoRollCenterNote_ - totalNotes / 2);  // Center around played notes
     
-    ImVec2 canvasPos = ImGui::GetCursorScreenPos();
-    ImVec2 canvasSize = ImGui::GetContentRegionAvail();
-    canvasSize.y = std::max(canvasSize.y, totalNotes * noteHeight);
+    // Reserve bottom 1/4 for velocity editor
+    ImVec2 fullCanvasPos = ImGui::GetCursorScreenPos();
+    ImVec2 fullCanvasSize = ImGui::GetContentRegionAvail();
+    const float velocityEditorHeight = std::max(80.0f, fullCanvasSize.y * 0.25f);
+    
+    ImVec2 canvasPos = fullCanvasPos;
+    ImVec2 canvasSize = fullCanvasSize;
+    canvasSize.y = std::max(fullCanvasSize.y - velocityEditorHeight - 4.0f, totalNotes * noteHeight);
     
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     
@@ -5353,7 +5780,219 @@ void MainWindow::renderPianoRoll() {
     ImGui::SetCursorScreenPos(canvasPos);
     ImGui::InvisibleButton("piano_roll_canvas", canvasSize);
     
+    // === VELOCITY EDITOR ===
+    // Draw velocity editor below the piano roll
+    float velocityY = canvasPos.y + canvasSize.y + 4.0f;
+    float velocityX = canvasPos.x + pianoKeyWidth;
+    float velocityWidth = canvasSize.x - pianoKeyWidth;
+    
+    renderVelocityEditor(velocityX, velocityY, velocityWidth, velocityEditorHeight);
+    
     ImGui::End();
+#endif
+}
+
+void MainWindow::renderVelocityEditor(float canvasX, float canvasY, float canvasWidth, float canvasHeight) {
+#ifdef PAN_USE_GUI
+    if (tracks_.empty() || selectedTrackIndex_ >= tracks_.size()) return;
+    
+    auto& track = tracks_[selectedTrackIndex_];
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    
+    const float pixelsPerBeat = 50.0f;
+    const float pianoKeyWidth = 60.0f;
+    const float scrollX = 0.0f;  // Piano roll starts at beat 0
+    
+    // Background
+    drawList->AddRectFilled(
+        ImVec2(canvasX - pianoKeyWidth, canvasY),
+        ImVec2(canvasX + canvasWidth, canvasY + canvasHeight),
+        IM_COL32(25, 25, 28, 255)
+    );
+    
+    // Label area
+    drawList->AddRectFilled(
+        ImVec2(canvasX - pianoKeyWidth, canvasY),
+        ImVec2(canvasX, canvasY + canvasHeight),
+        IM_COL32(40, 40, 45, 255)
+    );
+    drawList->AddText(ImVec2(canvasX - pianoKeyWidth + 5, canvasY + 5), IM_COL32(150, 150, 150, 255), "VEL");
+    
+    // Draw velocity scale lines
+    for (int i = 0; i <= 4; ++i) {
+        float y = canvasY + canvasHeight - (i / 4.0f) * canvasHeight;
+        ImU32 lineColor = (i == 4) ? IM_COL32(100, 100, 100, 100) : IM_COL32(50, 50, 55, 100);
+        drawList->AddLine(ImVec2(canvasX, y), ImVec2(canvasX + canvasWidth, y), lineColor);
+    }
+    
+    // Draw beat grid lines
+    float gridEndBeat = scrollX + canvasWidth / pixelsPerBeat;
+    
+    for (float beat = 0.0f; beat <= gridEndBeat; beat += 1.0f) {
+        float x = canvasX + (beat - scrollX) * pixelsPerBeat;
+        if (x >= canvasX && x <= canvasX + canvasWidth) {
+            bool isMeasure = (static_cast<int>(beat) % 4 == 0);
+            ImU32 lineColor = isMeasure ? IM_COL32(70, 70, 75, 150) : IM_COL32(40, 40, 45, 100);
+            drawList->AddLine(ImVec2(x, canvasY), ImVec2(x, canvasY + canvasHeight), lineColor);
+        }
+    }
+    
+    // Get track color
+    static const ImU32 trackColors[24] = {
+        IM_COL32(255, 149, 0, 255), IM_COL32(255, 94, 94, 255),
+        IM_COL32(255, 94, 153, 255), IM_COL32(219, 103, 186, 255),
+        IM_COL32(179, 102, 219, 255), IM_COL32(138, 103, 219, 255),
+        IM_COL32(102, 128, 219, 255), IM_COL32(51, 153, 219, 255),
+        IM_COL32(51, 179, 204, 255), IM_COL32(0, 199, 140, 255),
+        IM_COL32(79, 199, 102, 255), IM_COL32(132, 214, 79, 255),
+        IM_COL32(255, 179, 102, 255), IM_COL32(255, 128, 128, 255),
+        IM_COL32(255, 153, 187, 255), IM_COL32(230, 153, 204, 255),
+        IM_COL32(204, 153, 230, 255), IM_COL32(179, 153, 230, 255),
+        IM_COL32(153, 170, 230, 255), IM_COL32(128, 191, 230, 255),
+        IM_COL32(128, 217, 217, 255), IM_COL32(102, 217, 191, 255),
+        IM_COL32(153, 230, 153, 255), IM_COL32(255, 230, 102, 255)
+    };
+    int colorIdx = track.colorIndex % 24;
+    ImU32 trackColor = trackColors[colorIdx];
+    
+    // Draw velocity bars for each note in all clips
+    for (size_t clipIdx = 0; clipIdx < track.clips.size(); ++clipIdx) {
+        auto& clip = track.clips[clipIdx];
+        if (!clip) continue;
+        
+        auto& events = const_cast<std::vector<MidiClip::MidiEvent>&>(clip->getEvents());
+        float clipStartBeat = static_cast<float>(clip->getStartTime()) / (44100.0f * 60.0f / bpm_);
+        
+        for (size_t i = 0; i < events.size(); ++i) {
+            auto& event = events[i];
+            if (!event.message.isNoteOn()) continue;
+            
+            float noteStartBeat = clipStartBeat + event.timestamp;
+            float x = canvasX + (noteStartBeat - scrollX) * pixelsPerBeat;
+            
+            // Skip notes outside visible area
+            if (x < canvasX - 20 || x > canvasX + canvasWidth + 20) continue;
+            
+            // Calculate bar height based on velocity
+            float velocity = event.message.getVelocity() / 127.0f;
+            float barHeight = velocity * (canvasHeight - 10.0f);
+            float barY = canvasY + canvasHeight - barHeight - 5.0f;
+            
+            // Bar width (thin vertical bar)
+            float barWidth = 6.0f;
+            
+            // Check if this note is selected
+            bool isSelected = selectedNotes_.count({selectedTrackIndex_, clipIdx}) > 0 ||
+                             selectedNotes_.count({selectedTrackIndex_, i}) > 0;
+            
+            // Draw velocity bar
+            ImU32 barColor = isSelected ? IM_COL32(255, 255, 255, 255) : trackColor;
+            drawList->AddRectFilled(
+                ImVec2(x - barWidth/2, barY),
+                ImVec2(x + barWidth/2, canvasY + canvasHeight - 5.0f),
+                barColor
+            );
+            
+            // Draw velocity handle at top
+            drawList->AddCircleFilled(ImVec2(x, barY), 4.0f, barColor);
+            
+            // Check for mouse interaction
+            ImVec2 mousePos = ImGui::GetMousePos();
+            bool hoveringBar = mousePos.x >= x - barWidth/2 - 4 && mousePos.x <= x + barWidth/2 + 4 &&
+                              mousePos.y >= barY - 4 && mousePos.y <= canvasY + canvasHeight;
+            
+            if (hoveringBar) {
+                // Show tooltip
+                ImGui::BeginTooltip();
+                ImGui::Text("Velocity: %d", event.message.getVelocity());
+                ImGui::EndTooltip();
+                
+                // Drag to change velocity
+                if (ImGui::IsMouseDown(0)) {
+                    float newVelocity = 1.0f - (mousePos.y - canvasY - 5.0f) / (canvasHeight - 10.0f);
+                    newVelocity = std::clamp(newVelocity, 0.0f, 1.0f);
+                    uint8_t newVel = static_cast<uint8_t>(newVelocity * 127);
+                    // Reconstruct the MIDI message with new velocity
+                    event.message = MidiMessage(MidiMessageType::NoteOn,
+                                               event.message.getChannel(),
+                                               event.message.getNoteNumber(), 
+                                               newVel);
+                    markDirty();
+                }
+            }
+        }
+    }
+    
+    // Also draw velocity for recording clip if present
+    if (track.recordingClip) {
+        auto& events = const_cast<std::vector<MidiClip::MidiEvent>&>(track.recordingClip->getEvents());
+        float clipStartBeat = static_cast<float>(track.recordingClip->getStartTime()) / (44100.0f * 60.0f / bpm_);
+        
+        for (size_t i = 0; i < events.size(); ++i) {
+            auto& event = events[i];
+            if (!event.message.isNoteOn()) continue;
+            
+            float noteStartBeat = clipStartBeat + event.timestamp;
+            float x = canvasX + (noteStartBeat - scrollX) * pixelsPerBeat;
+            
+            if (x < canvasX - 20 || x > canvasX + canvasWidth + 20) continue;
+            
+            float velocity = event.message.getVelocity() / 127.0f;
+            float barHeight = velocity * (canvasHeight - 10.0f);
+            float barY = canvasY + canvasHeight - barHeight - 5.0f;
+            float barWidth = 6.0f;
+            
+            // Recording clip notes shown in a different color
+            drawList->AddRectFilled(
+                ImVec2(x - barWidth/2, barY),
+                ImVec2(x + barWidth/2, canvasY + canvasHeight - 5.0f),
+                IM_COL32(255, 100, 100, 200)
+            );
+            drawList->AddCircleFilled(ImVec2(x, barY), 4.0f, IM_COL32(255, 100, 100, 200));
+        }
+    }
+    
+    // Draw mode: click and drag to set velocities
+    if (pencilToolActive_) {
+        ImVec2 mousePos = ImGui::GetMousePos();
+        if (mousePos.x >= canvasX && mousePos.x <= canvasX + canvasWidth &&
+            mousePos.y >= canvasY && mousePos.y <= canvasY + canvasHeight) {
+            
+            if (ImGui::IsMouseDown(0)) {
+                // Calculate velocity from mouse Y position
+                float targetVelocity = 1.0f - (mousePos.y - canvasY - 5.0f) / (canvasHeight - 10.0f);
+                targetVelocity = std::clamp(targetVelocity, 0.0f, 1.0f);
+                uint8_t targetVel = static_cast<uint8_t>(targetVelocity * 127);
+                
+                // Find notes near this beat position and set their velocity
+                for (auto& clip : track.clips) {
+                    if (!clip) continue;
+                    auto& events = const_cast<std::vector<MidiClip::MidiEvent>&>(clip->getEvents());
+                    float clipStartBeat = static_cast<float>(clip->getStartTime()) / (44100.0f * 60.0f / bpm_);
+                    
+                    for (auto& event : events) {
+                        if (!event.message.isNoteOn()) continue;
+                        
+                        // Check if note is within a small threshold of click position
+                        float noteBeat = clipStartBeat + event.timestamp;
+                        float noteX = canvasX + (noteBeat - scrollX) * pixelsPerBeat;
+                        
+                        if (std::abs(mousePos.x - noteX) < 10.0f) {
+                            event.message = MidiMessage(MidiMessageType::NoteOn,
+                                                       event.message.getChannel(),
+                                                       event.message.getNoteNumber(),
+                                                       targetVel);
+                            markDirty();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Make the velocity area interactive
+    ImGui::SetCursorScreenPos(ImVec2(canvasX - pianoKeyWidth, canvasY));
+    ImGui::InvisibleButton("velocity_canvas", ImVec2(canvasWidth + pianoKeyWidth, canvasHeight));
 #endif
 }
 
@@ -5507,17 +6146,21 @@ void MainWindow::initializeInstrumentPresets() {
     ));
     
     // Hollow Pad - Odd harmonics only create "hollow" nasal character
-    // Music theory: Square waves contain only odd harmonics (1, 3, 5, 7...)
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Hollow Pad",
-        "Pad",  // Fixed: Pads belong in Pad category
-        {
-            Oscillator(Waveform::Square, 1.0f, 0.5f),        // Square has odd harmonics naturally
-            Oscillator(Waveform::Sine, 3.0f, 0.25f),         // Reinforce 3rd harmonic
-            Oscillator(Waveform::Sine, 5.0f, 0.15f),         // 5th harmonic
-            Oscillator(Waveform::Sine, 7.0f, 0.1f)           // 7th harmonic
-        }
-    ));
+    {
+        InstrumentEnvelope envHollowPad;
+        envHollowPad.ampEnvelope = ADSREnvelope(0.5f, 0.3f, 0.75f, 1.8f);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Hollow Pad",
+            "Pad",
+            {
+                Oscillator(Waveform::Square, 1.0f, 0.5f),
+                Oscillator(Waveform::Sine, 3.0f, 0.25f),
+                Oscillator(Waveform::Sine, 5.0f, 0.15f),
+                Oscillator(Waveform::Sine, 7.0f, 0.1f)
+            },
+            envHollowPad
+        ));
+    }
     
     // Ring Mod Lead - Inharmonic bell-like (multiplicative/ring modulation)
     instrumentPresets_.push_back(InstrumentPreset(
@@ -5562,244 +6205,558 @@ void MainWindow::initializeInstrumentPresets() {
     
     // === PIANO CATEGORY ===
     
-    // Bright Piano - Harmonic series (additive)
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Bright Piano",
-        "Piano",
-        {
-            Oscillator(Waveform::Triangle, 1.0f, 0.5f),
-            Oscillator(Waveform::Sine, 2.0f, 0.3f),
-            Oscillator(Waveform::Sine, 3.0f, 0.15f),
-            Oscillator(Waveform::Sine, 4.0f, 0.1f),
-            Oscillator(Waveform::Sine, 5.0f, 0.05f)
-        }
-    ));
+    // Bright Piano - Harmonic series with percussive envelope
+    {
+        InstrumentEnvelope envBrightPiano;
+        envBrightPiano.ampEnvelope = ADSREnvelope(0.005f, 1.5f, 0.3f, 0.8f);  // Fast attack, long decay
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Bright Piano",
+            "Piano",
+            {
+                Oscillator(Waveform::Triangle, 1.0f, 0.5f),
+                Oscillator(Waveform::Sine, 2.0f, 0.3f),
+                Oscillator(Waveform::Sine, 3.0f, 0.15f),
+                Oscillator(Waveform::Sine, 4.0f, 0.1f),
+                Oscillator(Waveform::Sine, 5.0f, 0.05f)
+            },
+            envBrightPiano
+        ));
+    }
     
-    // Electric Piano - Inharmonic (multiplicative/FM-style)
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Electric Piano",
-        "Piano",
-        {
-            Oscillator(Waveform::Sine, 1.0f, 0.6f),          // Carrier
-            Oscillator(Waveform::Sine, 1.414f, 0.3f),        // Inharmonic (sqrt(2))
-            Oscillator(Waveform::Triangle, 2.0f, 0.2f),      // Even harmonic
-            Oscillator(Waveform::Sine, 3.732f, 0.15f)        // More inharmonicity
-        }
-    ));
+    // Electric Piano - Rhodes-style with bell-like envelope
+    {
+        InstrumentEnvelope envEPiano;
+        envEPiano.ampEnvelope = ADSREnvelope(0.001f, 2.0f, 0.2f, 1.0f);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Electric Piano",
+            "Piano",
+            {
+                Oscillator(Waveform::Sine, 1.0f, 0.6f),
+                Oscillator(Waveform::Sine, 1.414f, 0.3f),
+                Oscillator(Waveform::Triangle, 2.0f, 0.2f),
+                Oscillator(Waveform::Sine, 3.732f, 0.15f)
+            },
+            envEPiano
+        ));
+    }
     
-    // Dark Piano - Lower harmonics (subtractive)
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Dark Piano",
-        "Piano",
-        {
-            Oscillator(Waveform::Sine, 1.0f, 0.8f),          // Strong fundamental
-            Oscillator(Waveform::Triangle, 1.0f, 0.3f),      // Warmth
-            Oscillator(Waveform::Sine, 2.0f, 0.2f),          // 2nd harmonic only
-            Oscillator(Waveform::Sine, 0.5f, 0.15f)          // Sub-octave for depth
-        }
-    ));
+    // Dark Piano - Lower harmonics with warm envelope
+    {
+        InstrumentEnvelope envDarkPiano;
+        envDarkPiano.ampEnvelope = ADSREnvelope(0.01f, 2.5f, 0.25f, 1.2f);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Dark Piano",
+            "Piano",
+            {
+                Oscillator(Waveform::Sine, 1.0f, 0.8f),
+                Oscillator(Waveform::Triangle, 1.0f, 0.3f),
+                Oscillator(Waveform::Sine, 2.0f, 0.2f),
+                Oscillator(Waveform::Sine, 0.5f, 0.15f)
+            },
+            envDarkPiano
+        ));
+    }
     
     // === BASS CATEGORY ===
     
-    // Sub Bass - Optimized for maximum low-end (-1 octave from default)
-    // At C3 (130.8Hz MIDI), this plays at 32.7Hz (sub-bass sweet spot)
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Sub Bass",
-        "Bass",
-        {
-            // Primary sub layer: -2 octaves (0.25x)
-            Oscillator(Waveform::Sine, 0.25f, 0.9f),
-            // Harmonic layer: -1 octave for speaker audibility
-            Oscillator(Waveform::Sine, 0.5f, 0.25f),
-            // Presence layer: fundamental for note definition
-            Oscillator(Waveform::Triangle, 1.0f, 0.1f)
-        }
-    ));
+    // 808 Sub Bass - The classic TR-808 style with pitch drop
+    // IMPORTANT: Play this at low notes (C1-C2, MIDI 24-36) for proper sub bass
+    // The 808 is characterized by: Pure sine, pitch drop on attack, long decay
+    {
+        InstrumentEnvelope env808;
+        env808.ampEnvelope = ADSREnvelope(0.001f, 1.5f, 0.0f, 0.8f);  // Long decay for that sustained boom
+        env808.pitchEnvelope = PitchEnvelope(2.0f, 0.08f);  // Start 1 octave up, drop over 80ms
+        // Add a gentle low-pass to smooth it out
+        env808.filter.enabled = true;
+        env808.filter.cutoff = 0.3f;  // ~200Hz cutoff
+        env808.filter.resonance = 0.1f;
+        instrumentPresets_.push_back(InstrumentPreset(
+            "808 Sub",
+            "Bass",
+            {
+                // Main 808 tone - at fundamental frequency
+                // When you play C2 (65Hz), this gives you 65Hz - classic 808 territory
+                Oscillator(Waveform::Sine, 1.0f, 1.0f),
+                // Sub layer one octave down for weight
+                Oscillator(Waveform::Sine, 0.5f, 0.7f),
+            },
+            env808
+        ));
+    }
     
-    // Reese Bass - Detuned unison (-1 octave from default)
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Reese Bass",
-        "Bass",
-        {
-            Oscillator(Waveform::Sawtooth, 0.5f, 0.4f),
-            Oscillator(Waveform::Sawtooth, 0.4975f, 0.4f),   // Slightly detuned
-            Oscillator(Waveform::Sawtooth, 0.5025f, 0.4f),   // Slightly detuned
-            Oscillator(Waveform::Sine, 0.25f, 0.3f)          // Sub layer
-        }
-    ));
+    // 808 Boom - More aggressive attack, shorter decay
+    {
+        InstrumentEnvelope env808Boom;
+        env808Boom.ampEnvelope = ADSREnvelope(0.0005f, 0.6f, 0.0f, 0.3f);
+        env808Boom.pitchEnvelope = PitchEnvelope(3.0f, 0.05f);  // Higher pitch start, faster drop
+        instrumentPresets_.push_back(InstrumentPreset(
+            "808 Boom",
+            "Bass",
+            {
+                Oscillator(Waveform::Sine, 1.0f, 1.0f),
+                Oscillator(Waveform::Sine, 0.5f, 0.5f),
+            },
+            env808Boom
+        ));
+    }
     
-    // FM Bass - Classic DX7 style (-1 octave from default)
-    instrumentPresets_.push_back(InstrumentPreset(
-        "FM Bass",
-        "Bass",
-        {
-            Oscillator(Waveform::Sine, 0.5f, 0.6f),
-            Oscillator(Waveform::Sine, 1.0f, 0.35f),
-            Oscillator(Waveform::Sine, 1.75f, 0.2f),         // Inharmonic for "snap"
-            Oscillator(Waveform::Sine, 0.25f, 0.25f)
-        }
-    ));
+    // 808 Long - Extended sustain for melodic bass lines
+    {
+        InstrumentEnvelope env808Long;
+        env808Long.ampEnvelope = ADSREnvelope(0.001f, 0.5f, 0.7f, 1.5f);  // Has sustain for holding notes
+        env808Long.pitchEnvelope = PitchEnvelope(1.5f, 0.1f);  // Subtle pitch drop
+        env808Long.filter.enabled = true;
+        env808Long.filter.cutoff = 0.4f;
+        instrumentPresets_.push_back(InstrumentPreset(
+            "808 Long",
+            "Bass",
+            {
+                Oscillator(Waveform::Sine, 1.0f, 1.0f),
+                Oscillator(Waveform::Sine, 0.5f, 0.6f),
+                Oscillator(Waveform::Sine, 2.0f, 0.1f),  // Subtle octave up for presence
+            },
+            env808Long
+        ));
+    }
     
-    // Acid Bass - Square wave with harmonics (-1 octave from default)
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Acid Bass",
-        "Bass",
-        {
-            Oscillator(Waveform::Square, 0.5f, 0.5f),
-            Oscillator(Waveform::Sawtooth, 0.5f, 0.3f),
-            Oscillator(Waveform::Square, 0.25f, 0.2f)
-        }
-    ));
+    // 808 Distorted - With harmonics from triangle wave
+    {
+        InstrumentEnvelope env808Dist;
+        env808Dist.ampEnvelope = ADSREnvelope(0.0005f, 0.8f, 0.0f, 0.4f);
+        env808Dist.pitchEnvelope = PitchEnvelope(2.5f, 0.06f);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "808 Dirty",
+            "Bass",
+            {
+                Oscillator(Waveform::Sine, 1.0f, 0.8f),
+                Oscillator(Waveform::Triangle, 1.0f, 0.3f),  // Adds odd harmonics
+                Oscillator(Waveform::Sine, 0.5f, 0.5f),
+            },
+            env808Dist
+        ));
+    }
+    
+    // Reese Bass - Detuned unison with proper envelope
+    {
+        InstrumentEnvelope envReese;
+        envReese.ampEnvelope = ADSREnvelope(0.05f, 0.2f, 0.8f, 0.4f);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Reese Bass",
+            "Bass",
+            {
+                Oscillator(Waveform::Sawtooth, 0.5f, 0.4f, 0.0f),
+                Oscillator(Waveform::Sawtooth, 0.5f, 0.4f, -15.0f),   // Detuned -15 cents
+                Oscillator(Waveform::Sawtooth, 0.5f, 0.4f, +15.0f),   // Detuned +15 cents
+                Oscillator(Waveform::Sine, 0.25f, 0.4f)               // Sub layer
+            },
+            envReese
+        ));
+    }
+    
+    // FM Bass - Classic DX7 style with snappy envelope
+    {
+        InstrumentEnvelope envFM;
+        envFM.ampEnvelope = ADSREnvelope(0.001f, 0.15f, 0.5f, 0.2f);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "FM Bass",
+            "Bass",
+            {
+                Oscillator(Waveform::Sine, 0.5f, 0.6f),
+                Oscillator(Waveform::Sine, 1.0f, 0.35f),
+                Oscillator(Waveform::Sine, 1.75f, 0.2f),
+                Oscillator(Waveform::Sine, 0.25f, 0.25f)
+            },
+            envFM
+        ));
+    }
+    
+    // Acid Bass - TB-303 style with envelope
+    {
+        InstrumentEnvelope envAcid;
+        envAcid.ampEnvelope = ADSREnvelope(0.001f, 0.3f, 0.4f, 0.15f);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Acid Bass",
+            "Bass",
+            {
+                Oscillator(Waveform::Square, 0.5f, 0.5f),
+                Oscillator(Waveform::Sawtooth, 0.5f, 0.3f),
+                Oscillator(Waveform::Square, 0.25f, 0.2f)
+            },
+            envAcid
+        ));
+    }
     
     // === PAD CATEGORY ===
     
-    // Warm Pad - Soft even harmonics
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Warm Pad",
-        "Pad",
-        {
-            Oscillator(Waveform::Sine, 1.0f, 0.6f),
-            Oscillator(Waveform::Triangle, 1.0f, 0.3f),
-            Oscillator(Waveform::Sine, 2.0f, 0.2f),
-            Oscillator(Waveform::Sine, 0.5f, 0.15f)
-        }
-    ));
+    // Warm Pad - Soft even harmonics with slow envelope
+    {
+        InstrumentEnvelope envWarmPad;
+        envWarmPad.ampEnvelope = ADSREnvelope(0.8f, 0.3f, 0.7f, 1.5f);  // Slow attack/release
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Warm Pad",
+            "Pad",
+            {
+                Oscillator(Waveform::Sine, 1.0f, 0.6f),
+                Oscillator(Waveform::Triangle, 1.0f, 0.3f),
+                Oscillator(Waveform::Sine, 2.0f, 0.2f),
+                Oscillator(Waveform::Sine, 0.5f, 0.15f)
+            },
+            envWarmPad
+        ));
+    }
     
-    // String Pad - Rich harmonics (additive)
-    instrumentPresets_.push_back(InstrumentPreset(
-        "String Pad",
-        "Pad",
-        {
-            Oscillator(Waveform::Sawtooth, 1.0f, 0.3f),
-            Oscillator(Waveform::Sawtooth, 0.998f, 0.3f),
-            Oscillator(Waveform::Sawtooth, 1.002f, 0.3f),
-            Oscillator(Waveform::Sine, 2.0f, 0.1f)
-        }
-    ));
+    // String Pad - Rich harmonics with slow envelope
+    {
+        InstrumentEnvelope envStringPad;
+        envStringPad.ampEnvelope = ADSREnvelope(1.0f, 0.5f, 0.8f, 2.0f);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "String Pad",
+            "Pad",
+            {
+                Oscillator(Waveform::Sawtooth, 1.0f, 0.3f, -5.0f),
+                Oscillator(Waveform::Sawtooth, 1.0f, 0.3f, +5.0f),
+                Oscillator(Waveform::Sawtooth, 1.0f, 0.3f),
+                Oscillator(Waveform::Sine, 2.0f, 0.1f)
+            },
+            envStringPad
+        ));
+    }
     
-    // Glass Pad - Ethereal
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Glass Pad",
-        "Pad",
-        {
-            Oscillator(Waveform::Sine, 1.0f, 0.5f),
-            Oscillator(Waveform::Sine, 3.0f, 0.25f),
-            Oscillator(Waveform::Sine, 5.0f, 0.15f),
-            Oscillator(Waveform::Triangle, 7.0f, 0.08f)
-        }
-    ));
+    // Glass Pad - Ethereal with shimmer
+    {
+        InstrumentEnvelope envGlassPad;
+        envGlassPad.ampEnvelope = ADSREnvelope(0.6f, 0.4f, 0.75f, 2.5f);
+        envGlassPad.lfo1 = LFO(0.2f, 0.1f, LFO::Target::Pitch);  // Gentle shimmer
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Glass Pad",
+            "Pad",
+            {
+                Oscillator(Waveform::Sine, 1.0f, 0.5f),
+                Oscillator(Waveform::Sine, 3.0f, 0.25f),
+                Oscillator(Waveform::Sine, 5.0f, 0.15f),
+                Oscillator(Waveform::Triangle, 7.0f, 0.08f)
+            },
+            envGlassPad
+        ));
+    }
     
     // === LEAD CATEGORY ===
     
-    // Square Lead - Classic 8-bit
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Square Lead",
-        "Lead",
-        {
-            Oscillator(Waveform::Square, 1.0f, 0.6f),
-            Oscillator(Waveform::Square, 2.0f, 0.2f)
-        }
-    ));
+    // Square Lead - Classic 8-bit with quick attack
+    {
+        InstrumentEnvelope envSquareLead;
+        envSquareLead.ampEnvelope = ADSREnvelope(0.02f, 0.1f, 0.8f, 0.2f);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Square Lead",
+            "Lead",
+            {
+                Oscillator(Waveform::Square, 1.0f, 0.6f),
+                Oscillator(Waveform::Square, 2.0f, 0.2f)
+            },
+            envSquareLead
+        ));
+    }
     
     // Sync Lead - Bright and cutting
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Sync Lead",
-        "Lead",
-        {
-            Oscillator(Waveform::Sawtooth, 1.0f, 0.5f),
-            Oscillator(Waveform::Sawtooth, 2.0f, 0.4f),
-            Oscillator(Waveform::Sawtooth, 3.0f, 0.2f)
-        }
-    ));
+    {
+        InstrumentEnvelope envSyncLead;
+        envSyncLead.ampEnvelope = ADSREnvelope(0.01f, 0.15f, 0.7f, 0.15f);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Sync Lead",
+            "Lead",
+            {
+                Oscillator(Waveform::Sawtooth, 1.0f, 0.5f),
+                Oscillator(Waveform::Sawtooth, 2.0f, 0.4f),
+                Oscillator(Waveform::Sawtooth, 3.0f, 0.2f)
+            },
+            envSyncLead
+        ));
+    }
     
-    // PWM Lead - Pulse width mod simulation
-    instrumentPresets_.push_back(InstrumentPreset(
-        "PWM Lead",
-        "Lead",
-        {
-            Oscillator(Waveform::Square, 1.0f, 0.4f),
-            Oscillator(Waveform::Square, 1.01f, 0.3f),
-            Oscillator(Waveform::Square, 0.99f, 0.3f),
-            Oscillator(Waveform::Sine, 2.0f, 0.1f)
-        }
-    ));
+    // PWM Lead - Pulse width mod simulation with slow attack
+    {
+        InstrumentEnvelope envPWMLead;
+        envPWMLead.ampEnvelope = ADSREnvelope(0.1f, 0.2f, 0.8f, 0.3f);
+        envPWMLead.lfo1 = LFO(0.5f, 0.05f, LFO::Target::Pitch);  // Subtle vibrato
+        instrumentPresets_.push_back(InstrumentPreset(
+            "PWM Lead",
+            "Lead",
+            {
+                Oscillator(Waveform::Square, 1.0f, 0.4f, -10.0f),
+                Oscillator(Waveform::Square, 1.0f, 0.3f, +10.0f),
+                Oscillator(Waveform::Square, 1.0f, 0.3f),
+                Oscillator(Waveform::Sine, 2.0f, 0.1f)
+            },
+            envPWMLead
+        ));
+    }
     
     // === KEYS CATEGORY ===
     
-    // Organ - Drawbar style (additive)
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Organ",
-        "Keys",
-        {
-            Oscillator(Waveform::Sine, 0.5f, 0.3f),          // 16'
-            Oscillator(Waveform::Sine, 1.0f, 0.5f),          // 8'
-            Oscillator(Waveform::Sine, 2.0f, 0.4f),          // 4'
-            Oscillator(Waveform::Sine, 3.0f, 0.25f),         // 2 2/3'
-            Oscillator(Waveform::Sine, 4.0f, 0.15f)          // 2'
-        }
-    ));
+    // Organ - Drawbar style (instant on/off like real organs)
+    {
+        InstrumentEnvelope envOrgan;
+        envOrgan.ampEnvelope = ADSREnvelope(0.005f, 0.01f, 1.0f, 0.1f);  // Very fast, full sustain
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Organ",
+            "Keys",
+            {
+                Oscillator(Waveform::Sine, 0.5f, 0.3f),
+                Oscillator(Waveform::Sine, 1.0f, 0.5f),
+                Oscillator(Waveform::Sine, 2.0f, 0.4f),
+                Oscillator(Waveform::Sine, 3.0f, 0.25f),
+                Oscillator(Waveform::Sine, 4.0f, 0.15f)
+            },
+            envOrgan
+        ));
+    }
     
-    // Clavinet - Funky keys
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Clavinet",
-        "Keys",
-        {
-            Oscillator(Waveform::Square, 1.0f, 0.5f),
-            Oscillator(Waveform::Sawtooth, 1.0f, 0.3f),
-            Oscillator(Waveform::Square, 2.0f, 0.2f),
-            Oscillator(Waveform::Sawtooth, 4.0f, 0.1f)
-        }
-    ));
+    // Clavinet - Funky keys with snappy envelope
+    {
+        InstrumentEnvelope envClav;
+        envClav.ampEnvelope = ADSREnvelope(0.001f, 0.5f, 0.4f, 0.2f);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Clavinet",
+            "Keys",
+            {
+                Oscillator(Waveform::Square, 1.0f, 0.5f),
+                Oscillator(Waveform::Sawtooth, 1.0f, 0.3f),
+                Oscillator(Waveform::Square, 2.0f, 0.2f),
+                Oscillator(Waveform::Sawtooth, 4.0f, 0.1f)
+            },
+            envClav
+        ));
+    }
     
-    // Harpsichord - Bright pluck
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Harpsichord",
-        "Keys",
-        {
-            Oscillator(Waveform::Sawtooth, 1.0f, 0.4f),
-            Oscillator(Waveform::Sawtooth, 2.0f, 0.35f),
-            Oscillator(Waveform::Triangle, 3.0f, 0.2f),
-            Oscillator(Waveform::Sawtooth, 4.0f, 0.15f)
-        }
-    ));
+    // Harpsichord - Bright pluck with fast decay
+    {
+        InstrumentEnvelope envHarpsi;
+        envHarpsi.ampEnvelope = ADSREnvelope(0.001f, 0.8f, 0.0f, 0.3f);  // No sustain
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Harpsichord",
+            "Keys",
+            {
+                Oscillator(Waveform::Sawtooth, 1.0f, 0.4f),
+                Oscillator(Waveform::Sawtooth, 2.0f, 0.35f),
+                Oscillator(Waveform::Triangle, 3.0f, 0.2f),
+                Oscillator(Waveform::Sawtooth, 4.0f, 0.15f)
+            },
+            envHarpsi
+        ));
+    }
     
     // === PLUCK CATEGORY ===
     
-    // Pluck - Karplus-Strong style
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Pluck",
-        "Pluck",
-        {
-            Oscillator(Waveform::Triangle, 1.0f, 0.6f),
-            Oscillator(Waveform::Sine, 2.0f, 0.25f),
-            Oscillator(Waveform::Sine, 3.0f, 0.15f)
-        }
-    ));
+    // Pluck - Karplus-Strong style with fast decay
+    {
+        InstrumentEnvelope envPluck;
+        envPluck.ampEnvelope = ADSREnvelope(0.001f, 0.6f, 0.0f, 0.3f);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Pluck",
+            "Pluck",
+            {
+                Oscillator(Waveform::Triangle, 1.0f, 0.6f),
+                Oscillator(Waveform::Sine, 2.0f, 0.25f),
+                Oscillator(Waveform::Sine, 3.0f, 0.15f)
+            },
+            envPluck
+        ));
+    }
     
-    // Marimba - Wooden mallet percussion
-    // Music theory: Marimba bars are tuned so the 4:1 partial is exactly 2 octaves up
-    // Real marimba partials: 1.0, 4.0 (tuned), ~9.2 (natural 3rd mode)
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Marimba",
-        "Pluck",
-        {
-            Oscillator(Waveform::Sine, 1.0f, 0.7f),          // Fundamental
-            Oscillator(Waveform::Sine, 4.0f, 0.35f),         // 4:1 tuned partial (2 octaves up)
-            Oscillator(Waveform::Sine, 9.2f, 0.12f)          // Natural 3rd mode partial
-        }
-    ));
+    // Marimba - Bell-like decay
+    {
+        InstrumentEnvelope envMarimba;
+        envMarimba.ampEnvelope = ADSREnvelope(0.001f, 1.2f, 0.0f, 0.5f);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Marimba",
+            "Pluck",
+            {
+                Oscillator(Waveform::Sine, 1.0f, 0.7f),
+                Oscillator(Waveform::Sine, 4.0f, 0.35f),
+                Oscillator(Waveform::Sine, 9.2f, 0.12f)
+            },
+            envMarimba
+        ));
+    }
     
     // Kalimba - Thumb piano
-    instrumentPresets_.push_back(InstrumentPreset(
-        "Kalimba",
-        "Pluck",
-        {
-            Oscillator(Waveform::Sine, 1.0f, 0.6f),
-            Oscillator(Waveform::Sine, 3.0f, 0.3f),
-            Oscillator(Waveform::Sine, 5.0f, 0.15f),
-            Oscillator(Waveform::Triangle, 7.0f, 0.08f)
-        }
-    ));
+    {
+        InstrumentEnvelope envKalimba;
+        envKalimba.ampEnvelope = ADSREnvelope(0.001f, 0.4f, 0.0f, 0.3f);  // Plucky, no sustain
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Kalimba",
+            "Pluck",
+            {
+                Oscillator(Waveform::Sine, 1.0f, 0.6f),
+                Oscillator(Waveform::Sine, 3.0f, 0.3f),
+                Oscillator(Waveform::Sine, 5.0f, 0.15f),
+                Oscillator(Waveform::Triangle, 7.0f, 0.08f)
+            },
+            envKalimba
+        ));
+    }
+    
+    // === ATMOSPHERE CATEGORY ===
+    // Evolving pads inspired by Hyper Light Drifter's ambient soundtrack
+    // These change and morph when holding keys
+    
+    // Drifter Pad - Slow evolving ethereal texture
+    {
+        InstrumentEnvelope envDrifter;
+        envDrifter.ampEnvelope = ADSREnvelope(2.5f, 1.0f, 0.7f, 3.0f);  // Very slow attack/release
+        envDrifter.lfo1 = LFO(0.1f, 0.3f, LFO::Target::Pitch);   // Slow pitch wobble
+        envDrifter.lfo2 = LFO(0.07f, 0.4f, LFO::Target::Amplitude);  // Amplitude swell
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Drifter",
+            "Atmosphere",
+            {
+                // Detuned unison for width
+                Oscillator(Waveform::Sine, 1.0f, 0.4f, -8.0f),
+                Oscillator(Waveform::Sine, 1.0f, 0.4f, +8.0f),
+                // Fifth harmony
+                Oscillator(Waveform::Triangle, 1.5f, 0.25f, -5.0f),
+                // Octave shimmer
+                Oscillator(Waveform::Sine, 2.0f, 0.15f, +12.0f),
+                // Sub foundation
+                Oscillator(Waveform::Sine, 0.5f, 0.3f)
+            },
+            envDrifter
+        ));
+    }
+    
+    // Crystalline - Glassy, evolving harmonics
+    {
+        InstrumentEnvelope envCrystal;
+        envCrystal.ampEnvelope = ADSREnvelope(1.5f, 0.5f, 0.8f, 4.0f);
+        envCrystal.lfo1 = LFO(0.15f, 0.2f, LFO::Target::Pitch);
+        envCrystal.lfo2 = LFO(0.23f, 0.3f, LFO::Target::Amplitude);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Crystalline",
+            "Atmosphere",
+            {
+                Oscillator(Waveform::Triangle, 1.0f, 0.5f),
+                Oscillator(Waveform::Sine, 2.0f, 0.3f, +7.0f),
+                Oscillator(Waveform::Sine, 3.0f, 0.2f, -7.0f),
+                Oscillator(Waveform::Sine, 4.0f, 0.15f, +14.0f),
+                Oscillator(Waveform::Sine, 5.0f, 0.1f)
+            },
+            envCrystal
+        ));
+    }
+    
+    // Void - Dark, rumbling atmosphere
+    {
+        InstrumentEnvelope envVoid;
+        envVoid.ampEnvelope = ADSREnvelope(3.0f, 2.0f, 0.6f, 5.0f);
+        envVoid.lfo1 = LFO(0.05f, 0.15f, LFO::Target::Pitch);  // Very slow drift
+        envVoid.lfo2 = LFO(0.12f, 0.5f, LFO::Target::Amplitude);  // Breathing
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Void",
+            "Atmosphere",
+            {
+                // Deep sub drones
+                Oscillator(Waveform::Sine, 0.25f, 0.6f),
+                Oscillator(Waveform::Sine, 0.5f, 0.5f, -10.0f),
+                Oscillator(Waveform::Triangle, 0.5f, 0.3f, +10.0f),
+                // Distant harmonic
+                Oscillator(Waveform::Sine, 1.0f, 0.2f),
+                // Dark overtone
+                Oscillator(Waveform::Triangle, 1.5f, 0.1f)
+            },
+            envVoid
+        ));
+    }
+    
+    // Northern Lights - Shimmering, otherworldly
+    {
+        InstrumentEnvelope envAurora;
+        envAurora.ampEnvelope = ADSREnvelope(2.0f, 1.5f, 0.75f, 4.0f);
+        envAurora.lfo1 = LFO(0.08f, 0.25f, LFO::Target::Pitch);
+        envAurora.lfo2 = LFO(0.19f, 0.35f, LFO::Target::Amplitude);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Aurora",
+            "Atmosphere",
+            {
+                // Wide stereo foundation
+                Oscillator(Waveform::Sine, 1.0f, 0.35f, -15.0f),
+                Oscillator(Waveform::Sine, 1.0f, 0.35f, +15.0f),
+                // Perfect fifth shimmer
+                Oscillator(Waveform::Triangle, 1.498f, 0.25f),
+                Oscillator(Waveform::Triangle, 1.502f, 0.25f),
+                // High harmonic sparkle
+                Oscillator(Waveform::Sine, 3.0f, 0.12f, +20.0f),
+                Oscillator(Waveform::Sine, 4.0f, 0.08f, -20.0f)
+            },
+            envAurora
+        ));
+    }
+    
+    // Ancient Temple - Mysterious, reverberant
+    {
+        InstrumentEnvelope envTemple;
+        envTemple.ampEnvelope = ADSREnvelope(1.8f, 1.0f, 0.7f, 6.0f);  // Very long release
+        envTemple.lfo1 = LFO(0.03f, 0.1f, LFO::Target::Pitch);  // Barely perceptible drift
+        envTemple.lfo2 = LFO(0.09f, 0.4f, LFO::Target::Amplitude);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Ancient Temple",
+            "Atmosphere",
+            {
+                // Fundamental drone
+                Oscillator(Waveform::Sine, 1.0f, 0.5f),
+                // Perfect fifth (sacred interval)
+                Oscillator(Waveform::Sine, 1.5f, 0.35f, -6.0f),
+                Oscillator(Waveform::Sine, 1.5f, 0.35f, +6.0f),
+                // Octave
+                Oscillator(Waveform::Triangle, 2.0f, 0.2f),
+                // Sub presence
+                Oscillator(Waveform::Sine, 0.5f, 0.3f)
+            },
+            envTemple
+        ));
+    }
+    
+    // Digital Rain - Glitchy, evolving texture
+    {
+        InstrumentEnvelope envRain;
+        envRain.ampEnvelope = ADSREnvelope(0.8f, 0.5f, 0.65f, 2.5f);
+        envRain.lfo1 = LFO(0.33f, 0.15f, LFO::Target::Pitch);  // Faster modulation
+        envRain.lfo2 = LFO(0.17f, 0.45f, LFO::Target::Amplitude);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Digital Rain",
+            "Atmosphere",
+            {
+                Oscillator(Waveform::Square, 1.0f, 0.25f, -20.0f),
+                Oscillator(Waveform::Square, 1.0f, 0.25f, +20.0f),
+                Oscillator(Waveform::Sine, 2.0f, 0.3f),
+                Oscillator(Waveform::Triangle, 3.0f, 0.15f, +10.0f),
+                Oscillator(Waveform::Sine, 0.5f, 0.2f)
+            },
+            envRain
+        ));
+    }
+    
+    // Distant Memory - Nostalgic, warm evolving pad
+    {
+        InstrumentEnvelope envMemory;
+        envMemory.ampEnvelope = ADSREnvelope(3.5f, 2.0f, 0.5f, 5.0f);
+        envMemory.lfo1 = LFO(0.06f, 0.2f, LFO::Target::Pitch);
+        envMemory.lfo2 = LFO(0.11f, 0.5f, LFO::Target::Amplitude);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Distant Memory",
+            "Atmosphere",
+            {
+                // Warm detuned core
+                Oscillator(Waveform::Triangle, 1.0f, 0.4f, -12.0f),
+                Oscillator(Waveform::Triangle, 1.0f, 0.4f, +12.0f),
+                // Gentle harmonics
+                Oscillator(Waveform::Sine, 2.0f, 0.25f),
+                Oscillator(Waveform::Sine, 3.0f, 0.1f),
+                // Sub warmth
+                Oscillator(Waveform::Sine, 0.5f, 0.35f)
+            },
+            envMemory
+        ));
+    }
     
     std::cout << "Initialized " << instrumentPresets_.size() << " instrument presets" << std::endl;
 }
