@@ -20,6 +20,9 @@ set(LIB_SOURCES
     src/audio/audio_buffer.cpp
     src/audio/audio_device.cpp
     src/audio/reverb.cpp
+    src/audio/chorus.cpp
+    src/audio/distortion.cpp
+    src/audio/sampler.cpp
     src/project/project_manager.cpp
     src/track/track.cpp
     src/track/track_manager.cpp

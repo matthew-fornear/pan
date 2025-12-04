@@ -1,6 +1,10 @@
 #include "pan/gui/main_window.h"
 #include "pan/audio/reverb.h"
+#include "pan/audio/chorus.h"
+#include "pan/audio/distortion.h"
+#include "pan/audio/sampler.h"
 #include <iostream>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <thread>
@@ -56,8 +60,7 @@ Track::Track()
     , waveformBufferWritePos(0)
     , waveformBufferMutex(std::make_unique<std::mutex>())
 {
-    // Initialize with one default sine oscillator
-    oscillators.push_back(Oscillator(Waveform::Sine, 1.0f, 1.0f));
+    // Track starts empty - drag instruments/samples from browser to load
 }
 
 void Track::addWaveformSample(float sample) {
@@ -191,7 +194,7 @@ bool MainWindow::initialize() {
     const GLFWvidmode* mode = glfwGetVideoMode(primaryMonitor);
     
     // Create window - use monitor resolution
-    GLFWwindow* window = glfwCreateWindow(mode->width, mode->height, "Pan Synthesizer", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(mode->width, mode->height, "PANDAW", nullptr, nullptr);
     if (!window) {
         std::cerr << "Failed to create GLFW window" << std::endl;
         glfwTerminate();
@@ -317,6 +320,35 @@ bool MainWindow::initialize() {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     
+    // Load custom fonts for better typography
+    
+    // Try to load a modern sans-serif font (common on Linux systems)
+    const char* fontPaths[] = {
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+        "/usr/share/fonts/ubuntu/Ubuntu-R.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        nullptr
+    };
+    
+    bool fontLoaded = false;
+    for (int i = 0; fontPaths[i] != nullptr; ++i) {
+        struct stat buffer;
+        if (stat(fontPaths[i], &buffer) == 0) {
+            // Font file exists - load it at 15px for regular text
+            io.Fonts->AddFontFromFileTTF(fontPaths[i], 15.0f);
+            std::cout << "Loaded font: " << fontPaths[i] << std::endl;
+            fontLoaded = true;
+            break;
+        }
+    }
+    
+    if (!fontLoaded) {
+        std::cout << "Using default ImGui font (no system fonts found)" << std::endl;
+    }
+    
     // Setup Dear ImGui style - Ableton Live inspired dark theme
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
@@ -431,6 +463,9 @@ bool MainWindow::initialize() {
     
     // Load user-saved presets
     loadUserPresets();
+    
+    // Load samples from samples directory
+    loadSamplesFromDirectory();
     
     // Initialize audio and MIDI
     if (!initializeAudio()) {
@@ -828,16 +863,18 @@ void MainWindow::renderUI() {
         ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
         ImGui::DockBuilderSetNodeSize(dockspace_id, dockspaceSize);
         
-        // Split vertically: top ~60% for tracks, bottom ~40% for piano roll + components
+        // Split vertically: top ~50% for tracks, bottom ~50% for piano roll + components
+        // Generous bottom section to prevent content falling off screen
         ImGuiID dock_id_top;
-        ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Down, 0.40f, &dock_id_bottom_static, &dock_id_top);
+        ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Down, 0.50f, &dock_id_bottom_static, &dock_id_top);
         
         // Split top into left (Sample Library) and right (tracks with timeline)
         // Use 0.1f (10%) for Sample Library to make it much more compact
         ImGui::DockBuilderSplitNode(dock_id_top, ImGuiDir_Left, 0.1f, &dock_id_left, &dock_id_right);
         
-        // Split bottom into piano roll (top 60%) and components (bottom 40%)
-        ImGui::DockBuilderSplitNode(dock_id_bottom_static, ImGuiDir_Down, 0.40f, &dock_id_components, &dock_id_piano_roll);
+        // Split bottom into piano roll (top 65%) and components (bottom 35%)
+        // Components get more room (35% of bottom = ~17.5% of screen)
+        ImGui::DockBuilderSplitNode(dock_id_bottom_static, ImGuiDir_Down, 0.35f, &dock_id_components, &dock_id_piano_roll);
         
         // Configure nodes
         ImGuiDockNode* node_piano_roll = ImGui::DockBuilderGetNode(dock_id_piano_roll);
@@ -883,6 +920,12 @@ void MainWindow::renderUI() {
         ImGui::DockBuilderFinish(dockspace_id);
     }
     
+    // Reset cursor to arrow at start of frame - individual windows can override
+    // This ensures cursor doesn't get "stuck" in None state when moving between windows
+    if (pencilToolActive_) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow);
+    }
+    
     // Render windows - they'll be docked into the pre-configured nodes
     // Pass the specific node IDs so they dock into the correct split nodes
     renderSampleLibrary(dock_id_left);
@@ -906,6 +949,12 @@ void MainWindow::renderUI() {
         }
     }
     
+    // Handle Spacebar for play/pause
+    if (ImGui::IsKeyPressed(ImGuiKey_Space) && !ImGui::GetIO().WantTextInput) {
+        isPlaying_ = !isPlaying_;
+        isCountingIn_ = false;  // Cancel count-in if active
+    }
+    
     ImGui::End(); // DockSpace
 #endif
 }
@@ -924,8 +973,14 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
     
     ImGui::Begin("Sample Library", nullptr, ImGuiWindowFlags_None);
     
-    // Title - "BROWSER" style like Ableton
-    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "BROWSER");
+    // Title - "BROWSER" centered
+    float windowWidth = ImGui::GetWindowWidth();
+    const char* browserTitle = "BROWSER";
+    float titleWidth = ImGui::CalcTextSize(browserTitle).x;
+    ImGui::SetCursorPosX((windowWidth - titleWidth) * 0.5f);
+    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s", browserTitle);
+    ImGui::Spacing();
+    ImGui::Separator();
     ImGui::Spacing();
     
     // Basic Waves section
@@ -992,6 +1047,185 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
                 }
                 ImGui::TreePop();
             }
+        }
+        
+        ImGui::PopStyleColor(2);
+    }
+    
+    // Sampler section - drag Simpler to tracks to create sampler instrument
+    if (ImGui::CollapsingHeader("Sampler", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.2f, 0.15f, 1.0f));
+        
+        // Draggable Sampler instrument - left aligned like other items
+        ImGui::PushID("sampler_drag");
+        // Use Selectable for consistent left-alignment with tree items
+        if (ImGui::Selectable("Sampler", false, 0, ImVec2(0, 22))) {
+            // Click to add to selected track
+            if (!tracks_.empty() && selectedTrackIndex_ < tracks_.size()) {
+                tracks_[selectedTrackIndex_].hasSampler = true;
+                tracks_[selectedTrackIndex_].samplerSamplePath = "";
+                tracks_[selectedTrackIndex_].samplerWaveform.clear();
+                tracks_[selectedTrackIndex_].oscillators.clear();  // Clear default oscillators
+                tracks_[selectedTrackIndex_].instrumentName = "Sampler";
+                markDirty();
+            }
+        }
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+            int dummy = 0;
+            ImGui::SetDragDropPayload("SIMPLER", &dummy, sizeof(int));
+            ImGui::Text("Add Sampler");
+            ImGui::EndDragDropSource();
+        }
+        ImGui::PopID();
+        
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Samples:");
+        
+        if (userSamples_.empty()) {
+            ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f), "  No samples loaded");
+            ImGui::TextColored(ImVec4(0.35f, 0.35f, 0.35f, 1.0f), "  (Drag WAV files here)");
+        } else {
+            for (size_t i = 0; i < userSamples_.size(); ++i) {
+                const auto& sample = userSamples_[i];
+                ImGui::PushID(static_cast<int>(i + 8000));
+                
+                // Draw waveform preview
+                if (!sample.waveformDisplay.empty()) {
+                    ImDrawList* drawList = ImGui::GetWindowDrawList();
+                    ImVec2 pos = ImGui::GetCursorScreenPos();
+                    float width = ImGui::GetContentRegionAvail().x;
+                    float height = 24.0f;
+                    
+                    drawList->AddRectFilled(pos, ImVec2(pos.x + width, pos.y + height),
+                                           IM_COL32(25, 25, 25, 255), 2.0f);
+                    
+                    float centerY = pos.y + height / 2.0f;
+                    float xStep = width / sample.waveformDisplay.size();
+                    ImU32 waveColor = IM_COL32(255, 149, 0, 180);
+                    
+                    for (size_t j = 0; j < sample.waveformDisplay.size(); ++j) {
+                        float x = pos.x + j * xStep;
+                        float amp = sample.waveformDisplay[j] * (height / 2.0f - 2.0f);
+                        drawList->AddLine(ImVec2(x, centerY - amp), ImVec2(x, centerY + amp), waveColor);
+                    }
+                    
+                    drawList->AddText(ImVec2(pos.x + 4, pos.y + 4), 
+                                     IM_COL32(255, 255, 255, 200), sample.name.c_str());
+                    
+                    ImGui::Dummy(ImVec2(width, height));
+                } else {
+                    if (ImGui::Button(sample.name.c_str(), ImVec2(-1, 22))) {
+                        // Click action
+                    }
+                }
+                
+                // Right-click context menu for deletion
+                if (ImGui::BeginPopupContextItem()) {
+                    if (ImGui::MenuItem("Delete Sample")) {
+                        std::filesystem::remove(sample.path);
+                        userSamples_.erase(userSamples_.begin() + i);
+                        ImGui::EndPopup();
+                        ImGui::PopID();
+                        break;
+                    }
+                    ImGui::EndPopup();
+                }
+                
+                // Drag and drop source
+                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                    ImGui::SetDragDropPayload("SAMPLE", &i, sizeof(size_t));
+                    ImGui::Text("Load %s", sample.name.c_str());
+                    ImGui::EndDragDropSource();
+                }
+                
+                ImGui::PopID();
+                ImGui::Spacing();
+            }
+        }
+        
+        ImGui::PopStyleColor(2);
+    }
+    
+    // Effects section - with expandable preset lists like Instruments
+    if (ImGui::CollapsingHeader("Effects", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.25f, 0.35f, 1.0f));  // Blue tint
+        
+        // Reverb with presets
+        if (ImGui::TreeNode("Reverb")) {
+            const char* reverbPresets[] = { "Room", "Hall", "Chamber", "Plate", "Cathedral", "Ambient" };
+            for (int i = 0; i < 6; ++i) {
+                ImGui::PushID(10000 + i);
+                if (ImGui::Button(reverbPresets[i], ImVec2(-1, 22))) {
+                    if (!tracks_.empty() && selectedTrackIndex_ < tracks_.size()) {
+                        double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                        auto newReverb = std::make_shared<Reverb>(sampleRate);
+                        newReverb->loadPreset(static_cast<Reverb::Preset>(i));
+                        tracks_[selectedTrackIndex_].effects.push_back(newReverb);
+                        markDirty();
+                    }
+                }
+                // Drag drop source for preset
+                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                    int payload[2] = { 0, i }; // effectType=0 (Reverb), presetIdx=i
+                    ImGui::SetDragDropPayload("EFFECT_PRESET", payload, sizeof(payload));
+                    ImGui::Text("Add Reverb - %s", reverbPresets[i]);
+                    ImGui::EndDragDropSource();
+                }
+                ImGui::PopID();
+            }
+            ImGui::TreePop();
+        }
+        
+        // Chorus with presets
+        if (ImGui::TreeNode("Chorus")) {
+            const char* chorusPresets[] = { "Subtle", "Classic", "Deep", "Detune", "Vibrato" };
+            for (int i = 0; i < 5; ++i) {
+                ImGui::PushID(10100 + i);
+                if (ImGui::Button(chorusPresets[i], ImVec2(-1, 22))) {
+                    if (!tracks_.empty() && selectedTrackIndex_ < tracks_.size()) {
+                        double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                        auto newChorus = std::make_shared<Chorus>(sampleRate);
+                        newChorus->loadPreset(static_cast<Chorus::Preset>(i));
+                        tracks_[selectedTrackIndex_].effects.push_back(newChorus);
+                        markDirty();
+                    }
+                }
+                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                    int payload[2] = { 1, i }; // effectType=1 (Chorus), presetIdx=i
+                    ImGui::SetDragDropPayload("EFFECT_PRESET", payload, sizeof(payload));
+                    ImGui::Text("Add Chorus - %s", chorusPresets[i]);
+                    ImGui::EndDragDropSource();
+                }
+                ImGui::PopID();
+            }
+            ImGui::TreePop();
+        }
+        
+        // Distortion with presets
+        if (ImGui::TreeNode("Distortion")) {
+            const char* distortionPresets[] = { "Warm", "Crunch", "Heavy", "Fuzz", "Screamer" };
+            for (int i = 0; i < 5; ++i) {
+                ImGui::PushID(10200 + i);
+                if (ImGui::Button(distortionPresets[i], ImVec2(-1, 22))) {
+                    if (!tracks_.empty() && selectedTrackIndex_ < tracks_.size()) {
+                        double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                        auto newDistortion = std::make_shared<Distortion>(sampleRate);
+                        newDistortion->loadPreset(static_cast<Distortion::Preset>(i));
+                        tracks_[selectedTrackIndex_].effects.push_back(newDistortion);
+                        markDirty();
+                    }
+                }
+                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                    int payload[2] = { 2, i }; // effectType=2 (Distortion), presetIdx=i
+                    ImGui::SetDragDropPayload("EFFECT_PRESET", payload, sizeof(payload));
+                    ImGui::Text("Add Distortion - %s", distortionPresets[i]);
+                    ImGui::EndDragDropSource();
+                }
+                ImGui::PopID();
+            }
+            ImGui::TreePop();
         }
         
         ImGui::PopStyleColor(2);
@@ -1068,29 +1302,84 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
             
             // Show track name at top - Ableton style
             if (!tracks_.empty() && selectedTrackIndex_ < tracks_.size()) {
-                // Track indicator with color
-                static const ImU32 trackColors[16] = {
-                    IM_COL32(255, 94, 94, 255), IM_COL32(255, 149, 0, 255),
-                    IM_COL32(255, 212, 0, 255), IM_COL32(132, 214, 79, 255),
-                    IM_COL32(0, 199, 140, 255), IM_COL32(51, 153, 219, 255),
-                    IM_COL32(138, 103, 219, 255), IM_COL32(219, 103, 186, 255),
-                    IM_COL32(255, 128, 128, 255), IM_COL32(255, 179, 102, 255),
-                    IM_COL32(255, 230, 102, 255), IM_COL32(179, 230, 128, 255),
-                    IM_COL32(102, 217, 191, 255), IM_COL32(128, 191, 230, 255),
-                    IM_COL32(179, 153, 230, 255), IM_COL32(230, 153, 204, 255)
+                // Track indicator with color (24 colors, starting with orange)
+                static const ImU32 trackColors[24] = {
+                    IM_COL32(255, 149, 0, 255), IM_COL32(255, 94, 94, 255),
+                    IM_COL32(255, 94, 153, 255), IM_COL32(219, 103, 186, 255),
+                    IM_COL32(179, 102, 219, 255), IM_COL32(138, 103, 219, 255),
+                    IM_COL32(102, 128, 219, 255), IM_COL32(51, 153, 219, 255),
+                    IM_COL32(51, 179, 204, 255), IM_COL32(0, 199, 140, 255),
+                    IM_COL32(79, 199, 102, 255), IM_COL32(132, 214, 79, 255),
+                    IM_COL32(255, 179, 102, 255), IM_COL32(255, 128, 128, 255),
+                    IM_COL32(255, 153, 187, 255), IM_COL32(230, 153, 204, 255),
+                    IM_COL32(204, 153, 230, 255), IM_COL32(179, 153, 230, 255),
+                    IM_COL32(153, 170, 230, 255), IM_COL32(128, 191, 230, 255),
+                    IM_COL32(128, 217, 217, 255), IM_COL32(102, 217, 191, 255),
+                    IM_COL32(153, 230, 153, 255), IM_COL32(255, 230, 102, 255)
                 };
                 
                 // Color indicator dot
                 ImDrawList* drawList = ImGui::GetWindowDrawList();
                 ImVec2 dotPos = ImGui::GetCursorScreenPos();
-                int colorIdx = tracks_[selectedTrackIndex_].colorIndex % 16;
+                int colorIdx = tracks_[selectedTrackIndex_].colorIndex % 24;
                 drawList->AddCircleFilled(ImVec2(dotPos.x + 6, dotPos.y + 8), 5.0f, trackColors[colorIdx]);
                 ImGui::Dummy(ImVec2(16, 0));
                 ImGui::SameLine();
                 
+                // Track label with double-click rename support
                 char trackLabel[64];
-                snprintf(trackLabel, sizeof(trackLabel), "Track %zu", selectedTrackIndex_ + 1);
-                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "%s", trackLabel);
+                if (!tracks_[selectedTrackIndex_].name.empty()) {
+                    snprintf(trackLabel, sizeof(trackLabel), "%s", tracks_[selectedTrackIndex_].name.c_str());
+                } else {
+                    snprintf(trackLabel, sizeof(trackLabel), "Track %zu", selectedTrackIndex_ + 1);
+                }
+                
+                // Check if renaming this track from components panel
+                if (renamingTrackIndex_ == static_cast<int>(selectedTrackIndex_)) {
+                    ImGui::PushItemWidth(150);
+                    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.15f, 1.0f));
+                    
+                    if (ImGui::InputText("##comp_rename", trackRenameBuffer_, sizeof(trackRenameBuffer_), 
+                                        ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll)) {
+                        tracks_[selectedTrackIndex_].name = trackRenameBuffer_;
+                        renamingTrackIndex_ = -1;
+                        markDirty();
+                    }
+                    
+                    if (ImGui::IsItemVisible() && !ImGui::IsItemActive()) {
+                        ImGui::SetKeyboardFocusHere(-1);
+                    }
+                    
+                    if (ImGui::IsKeyPressed(ImGuiKey_Escape) || 
+                        (ImGui::IsMouseClicked(0) && !ImGui::IsItemHovered())) {
+                        renamingTrackIndex_ = -1;
+                    }
+                    
+                    ImGui::PopStyleColor();
+                    ImGui::PopItemWidth();
+                } else {
+                    // Clickable text with hover effect
+                    ImVec2 textPos = ImGui::GetCursorScreenPos();
+                    ImVec2 textSize = ImGui::CalcTextSize(trackLabel);
+                    ImVec2 textMin = textPos;
+                    ImVec2 textMax = ImVec2(textPos.x + textSize.x + 8.0f, textPos.y + textSize.y + 4.0f);
+                    
+                    ImGui::InvisibleButton("##track_label_btn", ImVec2(textSize.x + 8.0f, textSize.y + 4.0f));
+                    bool labelHovered = ImGui::IsItemHovered();
+                    
+                    if (labelHovered) {
+                        drawList->AddRectFilled(textMin, textMax, IM_COL32(60, 60, 60, 100), 2.0f);
+                    }
+                    
+                    drawList->AddText(ImVec2(textPos.x + 4.0f, textPos.y + 2.0f), 
+                                     IM_COL32(200, 200, 200, 255), trackLabel);
+                    
+                    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
+                        renamingTrackIndex_ = static_cast<int>(selectedTrackIndex_);
+                        strncpy(trackRenameBuffer_, trackLabel, sizeof(trackRenameBuffer_) - 1);
+                        trackRenameBuffer_[sizeof(trackRenameBuffer_) - 1] = '\0';
+                    }
+                }
                 
                 // "Save Preset" button
                 ImGui::SameLine();
@@ -1133,6 +1422,111 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                     renderComponentBox(selectedTrackIndex_, oscIdx, oscillators[oscIdx]);
                     ImGui::PopID();
                     ImGui::SameLine();
+                }
+                
+                // Render Simpler if track has sampler
+                if (tracks_[selectedTrackIndex_].hasSampler) {
+                    ImGui::NewLine();
+                    ImGui::Spacing();
+                    
+                    // Simpler box - Ableton style
+                    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
+                    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+                    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.1f, 0.1f, 0.1f, 1.0f));
+                    
+                    float simplerWidth = ImGui::GetContentRegionAvail().x;
+                    float simplerHeight = 140.0f;
+                    
+                    ImGui::BeginChild("SimplerBox", ImVec2(simplerWidth, simplerHeight), true);
+                    
+                    ImDrawList* drawList = ImGui::GetWindowDrawList();
+                    ImVec2 boxPos = ImGui::GetWindowPos();
+                    float boxWidth = ImGui::GetContentRegionAvail().x;
+                    
+                    // Header bar - blue when enabled
+                    float headerHeight = 22.0f;
+                    drawList->AddRectFilled(boxPos, ImVec2(boxPos.x + boxWidth + 16.0f, boxPos.y + headerHeight),
+                                           IM_COL32(60, 90, 130, 255), 4.0f, ImDrawFlags_RoundCornersTop);
+                    
+                    // Title "Sampler"
+                    drawList->AddText(ImVec2(boxPos.x + 8.0f, boxPos.y + 4.0f), 
+                                     IM_COL32(255, 255, 255, 255), "Sampler");
+                    
+                    // Power button (top right)
+                    ImVec2 powerPos = ImVec2(boxPos.x + boxWidth, boxPos.y + 5.0f);
+                    bool powerHovered = (ImGui::GetMousePos().x >= powerPos.x - 8 && 
+                                        ImGui::GetMousePos().x <= powerPos.x + 8 &&
+                                        ImGui::GetMousePos().y >= powerPos.y - 4 && 
+                                        ImGui::GetMousePos().y <= powerPos.y + 12);
+                    ImU32 powerColor = powerHovered ? IM_COL32(255, 200, 100, 255) : IM_COL32(200, 200, 200, 255);
+                    drawList->AddCircle(ImVec2(powerPos.x, powerPos.y + 6), 6.0f, powerColor, 12, 1.5f);
+                    
+                    if (powerHovered && ImGui::IsMouseClicked(0)) {
+                        tracks_[selectedTrackIndex_].hasSampler = false;
+                        markDirty();
+                    }
+                    
+                    // Skip past header
+                    ImGui::Dummy(ImVec2(0, headerHeight - 4));
+                    
+                    // Waveform display area
+                    ImVec2 waveformPos = ImGui::GetCursorScreenPos();
+                    float waveformWidth = boxWidth;
+                    float waveformHeight = 80.0f;
+                    
+                    // Waveform background
+                    drawList->AddRectFilled(waveformPos, 
+                                           ImVec2(waveformPos.x + waveformWidth, waveformPos.y + waveformHeight),
+                                           IM_COL32(25, 25, 30, 255), 2.0f);
+                    
+                    // Draw waveform if sample loaded
+                    if (!tracks_[selectedTrackIndex_].samplerWaveform.empty()) {
+                        float centerY = waveformPos.y + waveformHeight / 2.0f;
+                        float xStep = waveformWidth / tracks_[selectedTrackIndex_].samplerWaveform.size();
+                        ImU32 waveColor = IM_COL32(100, 180, 255, 200);
+                        
+                        for (size_t j = 0; j < tracks_[selectedTrackIndex_].samplerWaveform.size(); ++j) {
+                            float x = waveformPos.x + j * xStep;
+                            float amp = tracks_[selectedTrackIndex_].samplerWaveform[j] * (waveformHeight / 2.0f - 4.0f);
+                            drawList->AddLine(ImVec2(x, centerY - amp), ImVec2(x, centerY + amp), waveColor);
+                        }
+                    } else {
+                        // Empty state - "Drop sample here"
+                        const char* dropText = "Drop sample here";
+                        ImVec2 textSize = ImGui::CalcTextSize(dropText);
+                        drawList->AddText(ImVec2(waveformPos.x + (waveformWidth - textSize.x) / 2.0f,
+                                                waveformPos.y + (waveformHeight - textSize.y) / 2.0f),
+                                         IM_COL32(80, 80, 80, 255), dropText);
+                    }
+                    
+                    ImGui::Dummy(ImVec2(waveformWidth, waveformHeight));
+                    
+                    // Drop target for samples
+                    if (ImGui::BeginDragDropTarget()) {
+                        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("SAMPLE")) {
+                            if (payload->DataSize == sizeof(size_t)) {
+                                size_t sampleIdx = *(size_t*)payload->Data;
+                                if (sampleIdx < userSamples_.size()) {
+                                    tracks_[selectedTrackIndex_].samplerSamplePath = userSamples_[sampleIdx].path;
+                                    tracks_[selectedTrackIndex_].samplerWaveform = userSamples_[sampleIdx].waveformDisplay;
+                                    tracks_[selectedTrackIndex_].instrumentName = "Sampler: " + userSamples_[sampleIdx].name;
+                                    markDirty();
+                                }
+                            }
+                        }
+                        ImGui::EndDragDropTarget();
+                    }
+                    
+                    // Sample name if loaded
+                    if (!tracks_[selectedTrackIndex_].samplerSamplePath.empty()) {
+                        std::string sampleName = std::filesystem::path(tracks_[selectedTrackIndex_].samplerSamplePath).stem().string();
+                        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Sample: %s", sampleName.c_str());
+                    }
+                    
+                    ImGui::EndChild();
+                    ImGui::PopStyleColor(2);
+                    ImGui::PopStyleVar(2);
                 }
             } else {
                 ImGui::Text("No tracks available");
@@ -1206,30 +1600,46 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
             
             // Show track name at top
             if (!tracks_.empty() && selectedTrackIndex_ < tracks_.size()) {
+                // Track indicator with color
+                static const ImU32 trackColorsEff[24] = {
+                    IM_COL32(255, 149, 0, 255), IM_COL32(255, 94, 94, 255),
+                    IM_COL32(255, 94, 153, 255), IM_COL32(219, 103, 186, 255),
+                    IM_COL32(179, 102, 219, 255), IM_COL32(138, 103, 219, 255),
+                    IM_COL32(102, 128, 219, 255), IM_COL32(51, 153, 219, 255),
+                    IM_COL32(51, 179, 204, 255), IM_COL32(0, 199, 140, 255),
+                    IM_COL32(79, 199, 102, 255), IM_COL32(132, 214, 79, 255),
+                    IM_COL32(255, 179, 102, 255), IM_COL32(255, 128, 128, 255),
+                    IM_COL32(255, 153, 187, 255), IM_COL32(230, 153, 204, 255),
+                    IM_COL32(204, 153, 230, 255), IM_COL32(179, 153, 230, 255),
+                    IM_COL32(153, 170, 230, 255), IM_COL32(128, 191, 230, 255),
+                    IM_COL32(128, 217, 217, 255), IM_COL32(102, 217, 191, 255),
+                    IM_COL32(153, 230, 153, 255), IM_COL32(255, 230, 102, 255)
+                };
+                
+                ImDrawList* effDrawList = ImGui::GetWindowDrawList();
+                ImVec2 dotPosEff = ImGui::GetCursorScreenPos();
+                int colorIdxEff = tracks_[selectedTrackIndex_].colorIndex % 24;
+                effDrawList->AddCircleFilled(ImVec2(dotPosEff.x + 6, dotPosEff.y + 8), 5.0f, trackColorsEff[colorIdxEff]);
+                ImGui::Dummy(ImVec2(16, 0));
+                ImGui::SameLine();
+                
                 char trackLabel[64];
-                snprintf(trackLabel, sizeof(trackLabel), "Track %zu Effects:", selectedTrackIndex_ + 1);
-                ImGui::Text("%s", trackLabel);
+                if (!tracks_[selectedTrackIndex_].name.empty()) {
+                    snprintf(trackLabel, sizeof(trackLabel), "%s - Effects", tracks_[selectedTrackIndex_].name.c_str());
+                } else {
+                    snprintf(trackLabel, sizeof(trackLabel), "Track %zu - Effects", selectedTrackIndex_ + 1);
+                }
+                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "%s", trackLabel);
+                
                 ImGui::Separator();
-                ImGui::Spacing();
                 
-                // "Add Effect" dropdown button
-                if (ImGui::Button("+ Add Effect", ImVec2(150, 30))) {
-                    ImGui::OpenPopup("AddEffectPopup");
+                // Hint text for drag & drop
+                if (tracks_[selectedTrackIndex_].effects.empty()) {
+                    ImGui::Spacing();
+                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "  Drag effects from Browser to add");
+                    ImGui::Spacing();
                 }
                 
-                if (ImGui::BeginPopup("AddEffectPopup")) {
-                    if (ImGui::MenuItem("Reverb")) {
-                        auto reverb = std::make_shared<Reverb>(engine_ ? engine_->getSampleRate() : 44100.0);
-                        tracks_[selectedTrackIndex_].effects.push_back(reverb);
-                        markDirty();
-                        // Auto-scroll to show the new effect
-                        effectsScrollY_ = 9999.0f;  // Scroll to bottom
-                    }
-                    // TODO: Add more effects here (Delay, Chorus, Distortion, etc.)
-                    ImGui::EndPopup();
-                }
-                
-                ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::Spacing();
                 
@@ -1253,6 +1663,48 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                 }
                 
                 ImGui::EndChild();
+                
+                // Drop target for effects - covers entire Effects tab area
+                if (ImGui::BeginDragDropTarget()) {
+                    // Handle preset drops (effectType + presetIdx)
+                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("EFFECT_PRESET")) {
+                        if (payload->DataSize == sizeof(int) * 2) {
+                            int* data = (int*)payload->Data;
+                            int effectType = data[0];
+                            int presetIdx = data[1];
+                            double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                            std::shared_ptr<Effect> newEffect;
+                            
+                            switch (effectType) {
+                                case 0: {
+                                    auto reverb = std::make_shared<Reverb>(sampleRate);
+                                    reverb->loadPreset(static_cast<Reverb::Preset>(presetIdx));
+                                    newEffect = reverb;
+                                    break;
+                                }
+                                case 1: {
+                                    auto chorus = std::make_shared<Chorus>(sampleRate);
+                                    chorus->loadPreset(static_cast<Chorus::Preset>(presetIdx));
+                                    newEffect = chorus;
+                                    break;
+                                }
+                                case 2: {
+                                    auto distortion = std::make_shared<Distortion>(sampleRate);
+                                    distortion->loadPreset(static_cast<Distortion::Preset>(presetIdx));
+                                    newEffect = distortion;
+                                    break;
+                                }
+                            }
+                            
+                            if (newEffect && selectedTrackIndex_ < tracks_.size()) {
+                                tracks_[selectedTrackIndex_].effects.push_back(newEffect);
+                                markDirty();
+                                effectsScrollY_ = 9999.0f;
+                            }
+                        }
+                    }
+                    ImGui::EndDragDropTarget();
+                }
             } else {
                 ImGui::Text("No tracks available");
             }
@@ -1379,6 +1831,8 @@ void MainWindow::renderEffectBox(size_t trackIndex, size_t effectIndex, std::sha
     ImGui::PushID(static_cast<int>(effectIndex + 20000 * trackIndex));
     
     auto reverb = std::dynamic_pointer_cast<Reverb>(effect);
+    auto chorus = std::dynamic_pointer_cast<Chorus>(effect);
+    auto distortion = std::dynamic_pointer_cast<Distortion>(effect);
     
     // Ableton-style effect device box
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.12f, 1.0f));
@@ -1386,7 +1840,7 @@ void MainWindow::renderEffectBox(size_t trackIndex, size_t effectIndex, std::sha
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
     
-    ImGui::BeginChild(ImGui::GetID("effect_box"), ImVec2(200, 200), true, ImGuiWindowFlags_None);
+    ImGui::BeginChild(ImGui::GetID("effect_box"), ImVec2(200, 220), true, ImGuiWindowFlags_None);
     
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     ImVec2 boxPos = ImGui::GetWindowPos();
@@ -1400,7 +1854,7 @@ void MainWindow::renderEffectBox(size_t trackIndex, size_t effectIndex, std::sha
                            headerColor, 4.0f, ImDrawFlags_RoundCornersTop);
     
     // Effect name
-    const char* effectName = reverb ? "Reverb" : effect->getName().c_str();
+    const char* effectName = effect->getName().c_str();
     drawList->AddText(ImVec2(boxPos.x + 8, boxPos.y + 4), 
                      enabled ? IM_COL32(255, 255, 255, 255) : IM_COL32(150, 150, 150, 255), 
                      effectName);
@@ -1454,10 +1908,10 @@ void MainWindow::renderEffectBox(size_t trackIndex, size_t effectIndex, std::sha
     ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0.30f, 0.70f, 0.95f, 1.0f));
     
     if (reverb) {
-        // Preset selector
-        ImGui::SetNextItemWidth(120);
+        // Preset selector with arrow dropdown
+        ImGui::SetNextItemWidth(140);
         const char* currentPresetName = Reverb::getPresetName(reverb->getCurrentPreset());
-        if (ImGui::BeginCombo("##preset", currentPresetName)) {
+        if (ImGui::BeginCombo("Preset##reverb", currentPresetName)) {
             for (int i = 0; i < 7; ++i) {
                 Reverb::Preset preset = static_cast<Reverb::Preset>(i);
                 const char* presetName = Reverb::getPresetName(preset);
@@ -1514,6 +1968,118 @@ void MainWindow::renderEffectBox(size_t trackIndex, size_t effectIndex, std::sha
         if (anyChanged && reverb->getCurrentPreset() != Reverb::Preset::Custom) {
             reverb->setCurrentPreset(Reverb::Preset::Custom);
         }
+    } else if (chorus) {
+        // Chorus preset selector with arrow dropdown
+        ImGui::SetNextItemWidth(140);
+        const char* currentPresetName = Chorus::getPresetName(chorus->getCurrentPreset());
+        if (ImGui::BeginCombo("Preset##chorus", currentPresetName)) {
+            for (int i = 0; i < 6; ++i) {
+                Chorus::Preset preset = static_cast<Chorus::Preset>(i);
+                const char* presetName = Chorus::getPresetName(preset);
+                if (ImGui::Selectable(presetName, chorus->getCurrentPreset() == preset)) {
+                    chorus->loadPreset(preset);
+                    markDirty();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        
+        bool anyChanged = false;
+        
+        ImGui::SetNextItemWidth(120);
+        float rate = chorus->getRate();
+        if (ImGui::SliderFloat("##rate", &rate, 0.1f, 5.0f, "%.1f Hz")) {
+            chorus->setRate(rate);
+            anyChanged = true;
+            markDirty();
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Rate");
+        
+        ImGui::SetNextItemWidth(120);
+        float depth = chorus->getDepth();
+        if (ImGui::SliderFloat("##depth", &depth, 0.0f, 10.0f, "%.1f ms")) {
+            chorus->setDepth(depth);
+            anyChanged = true;
+            markDirty();
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Depth");
+        
+        ImGui::SetNextItemWidth(120);
+        float delay = chorus->getDelay();
+        if (ImGui::SliderFloat("##delay", &delay, 5.0f, 50.0f, "%.0f ms")) {
+            chorus->setDelay(delay);
+            anyChanged = true;
+            markDirty();
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Delay");
+        
+        ImGui::SetNextItemWidth(120);
+        float mix = chorus->getMix();
+        if (ImGui::SliderFloat("##mix", &mix, 0.0f, 1.0f, "%.2f")) {
+            chorus->setMix(mix);
+            anyChanged = true;
+            markDirty();
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Mix");
+        
+        if (anyChanged && chorus->getCurrentPreset() != Chorus::Preset::Custom) {
+            chorus->setCurrentPreset(Chorus::Preset::Custom);
+        }
+    } else if (distortion) {
+        // Distortion preset selector with arrow dropdown
+        ImGui::SetNextItemWidth(140);
+        const char* currentPresetName = Distortion::getPresetName(distortion->getCurrentPreset());
+        if (ImGui::BeginCombo("Preset##dist", currentPresetName)) {
+            for (int i = 0; i < 6; ++i) {
+                Distortion::Preset preset = static_cast<Distortion::Preset>(i);
+                const char* presetName = Distortion::getPresetName(preset);
+                if (ImGui::Selectable(presetName, distortion->getCurrentPreset() == preset)) {
+                    distortion->loadPreset(preset);
+                    markDirty();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        
+        bool anyChanged = false;
+        
+        ImGui::SetNextItemWidth(120);
+        float drive = distortion->getDrive();
+        if (ImGui::SliderFloat("##drive", &drive, 1.0f, 100.0f, "%.0f")) {
+            distortion->setDrive(drive);
+            anyChanged = true;
+            markDirty();
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Drive");
+        
+        ImGui::SetNextItemWidth(120);
+        float tone = distortion->getTone();
+        if (ImGui::SliderFloat("##tone", &tone, 0.0f, 1.0f, "%.2f")) {
+            distortion->setTone(tone);
+            anyChanged = true;
+            markDirty();
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Tone");
+        
+        ImGui::SetNextItemWidth(120);
+        float mix = distortion->getMix();
+        if (ImGui::SliderFloat("##distmix", &mix, 0.0f, 1.0f, "%.2f")) {
+            distortion->setMix(mix);
+            anyChanged = true;
+            markDirty();
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Mix");
+        
+        if (anyChanged && distortion->getCurrentPreset() != Distortion::Preset::Custom) {
+            distortion->setCurrentPreset(Distortion::Preset::Custom);
+        }
     }
     
     ImGui::PopStyleColor(4);
@@ -1533,24 +2099,34 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
     
     ImGui::Begin("Tracks", nullptr, ImGuiWindowFlags_None);
     
-    // Ableton-inspired track color palette (16 colors)
-    static const ImU32 trackColors[16] = {
-        IM_COL32(255, 94, 94, 255),   // Red
-        IM_COL32(255, 149, 0, 255),   // Orange  
-        IM_COL32(255, 212, 0, 255),   // Yellow
-        IM_COL32(132, 214, 79, 255),  // Lime
-        IM_COL32(0, 199, 140, 255),   // Teal
-        IM_COL32(51, 153, 219, 255),  // Blue
-        IM_COL32(138, 103, 219, 255), // Purple
-        IM_COL32(219, 103, 186, 255), // Pink
-        IM_COL32(255, 128, 128, 255), // Light red
-        IM_COL32(255, 179, 102, 255), // Peach
-        IM_COL32(255, 230, 102, 255), // Light yellow
-        IM_COL32(179, 230, 128, 255), // Light lime
-        IM_COL32(102, 217, 191, 255), // Light teal
-        IM_COL32(128, 191, 230, 255), // Light blue
-        IM_COL32(179, 153, 230, 255), // Light purple
-        IM_COL32(230, 153, 204, 255)  // Light pink
+    // Ableton-inspired track color palette (24 colors in HSL gradient, starting with ORANGE)
+    static const ImU32 trackColors[24] = {
+        // Row 1: Primary saturated colors (HSL gradient)
+        IM_COL32(255, 149, 0, 255),   // 0: Orange (playhead color) - START HERE
+        IM_COL32(255, 94, 94, 255),   // 1: Red
+        IM_COL32(255, 94, 153, 255),  // 2: Rose
+        IM_COL32(219, 103, 186, 255), // 3: Pink
+        IM_COL32(179, 102, 219, 255), // 4: Magenta
+        IM_COL32(138, 103, 219, 255), // 5: Purple
+        IM_COL32(102, 128, 219, 255), // 6: Indigo
+        IM_COL32(51, 153, 219, 255),  // 7: Blue
+        IM_COL32(51, 179, 204, 255),  // 8: Cyan
+        IM_COL32(0, 199, 140, 255),   // 9: Teal
+        IM_COL32(79, 199, 102, 255),  // 10: Green
+        IM_COL32(132, 214, 79, 255),  // 11: Lime
+        // Row 2: Lighter/pastel variants
+        IM_COL32(255, 179, 102, 255), // 12: Peach
+        IM_COL32(255, 128, 128, 255), // 13: Light red
+        IM_COL32(255, 153, 187, 255), // 14: Light rose
+        IM_COL32(230, 153, 204, 255), // 15: Light pink
+        IM_COL32(204, 153, 230, 255), // 16: Light magenta
+        IM_COL32(179, 153, 230, 255), // 17: Light purple
+        IM_COL32(153, 170, 230, 255), // 18: Light indigo
+        IM_COL32(128, 191, 230, 255), // 19: Light blue
+        IM_COL32(128, 217, 217, 255), // 20: Light cyan
+        IM_COL32(102, 217, 191, 255), // 21: Light teal
+        IM_COL32(153, 230, 153, 255), // 22: Light green
+        IM_COL32(255, 230, 102, 255)  // 23: Light yellow
     };
     
     // Get window info for drawing
@@ -1570,12 +2146,12 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
     for (size_t i = 0; i < tracks_.size(); ++i) {
         ImGui::PushID(static_cast<int>(i));
         
-        // Assign track color if not set
+        // Assign track color if not set (start with orange = index 0, cycle through 24 colors)
         if (tracks_[i].colorIndex == 0 && i > 0) {
-            tracks_[i].colorIndex = static_cast<int>(i % 16);
+            tracks_[i].colorIndex = static_cast<int>(i % 24);
         }
         
-        float headerHeight = 64.0f;  // More compact Ableton-style
+        float headerHeight = 60.0f;  // Compact like Ableton
         float columnWidth = ImGui::GetColumnWidth(0);
         float colorBarWidth = 6.0f;
         ImVec2 headerStartPos = ImGui::GetCursorScreenPos();
@@ -1590,7 +2166,7 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
                                trackBg);
         
         // Color bar on left edge
-        ImU32 trackColor = trackColors[tracks_[i].colorIndex % 16];
+        ImU32 trackColor = trackColors[tracks_[i].colorIndex % 24];
         drawList->AddRectFilled(headerStartPos,
                                ImVec2(headerStartPos.x + colorBarWidth, headerStartPos.y + headerHeight),
                                trackColor);
@@ -1602,26 +2178,96 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
                              IM_COL32(51, 153, 219, 255), 0.0f, 0, 2.0f);
         }
         
-        // Track number and name area
-        float contentStartX = headerStartPos.x + colorBarWidth + 8.0f;
-        float buttonSize = 20.0f;
-        float buttonSpacing = 4.0f;
+        // Calculate content area (between color bar and meter)
+        // Meter is flush with right edge - no margin to avoid dark bar
+        float meterWidth = 6.0f;
+        float contentStartX = headerStartPos.x + colorBarWidth + 10.0f;
+        float contentEndX = headerStartPos.x + columnWidth - meterWidth - 6.0f;
+        float contentWidth = contentEndX - contentStartX;
+        float contentCenterX = contentStartX + contentWidth / 2.0f;
         
-        // Track number (larger font simulation)
-        char trackNum[8];
-        snprintf(trackNum, sizeof(trackNum), "%zu", i + 1);
-        drawList->AddText(ImVec2(contentStartX, headerStartPos.y + 8.0f), 
-                         IM_COL32(200, 200, 200, 255), trackNum);
+        float buttonSize = 22.0f;
+        float buttonSpacing = 6.0f;
         
-        // Instrument name (smaller, secondary color)
-        if (!tracks_[i].instrumentName.empty()) {
-            drawList->AddText(ImVec2(contentStartX + 20.0f, headerStartPos.y + 8.0f),
-                             IM_COL32(150, 150, 150, 255), tracks_[i].instrumentName.c_str());
+        // Track label - supports custom names via double-click rename
+        // Format: "Track 1", "Track 1 - Sine", or custom name if set
+        char trackLabel[64];
+        if (!tracks_[i].name.empty()) {
+            // Use custom name if set
+            snprintf(trackLabel, sizeof(trackLabel), "%s", tracks_[i].name.c_str());
+        } else if (!tracks_[i].instrumentName.empty()) {
+            snprintf(trackLabel, sizeof(trackLabel), "Track %zu - %s", i + 1, tracks_[i].instrumentName.c_str());
+        } else {
+            snprintf(trackLabel, sizeof(trackLabel), "Track %zu", i + 1);
         }
         
-        // Button row: S M ● (Solo, Mute, Arm)
-        float buttonRowY = headerStartPos.y + 32.0f;
-        float buttonX = contentStartX;
+        // Label bounds for double-click detection
+        ImVec2 labelSize = ImGui::CalcTextSize(trackLabel);
+        float labelX = contentCenterX - labelSize.x / 2.0f;
+        labelX = std::max(labelX, contentStartX);
+        if (labelX + labelSize.x > contentEndX) {
+            labelX = contentEndX - labelSize.x;
+        }
+        float labelY = headerStartPos.y + 10.0f;
+        ImVec2 labelMin(labelX - 4.0f, labelY - 2.0f);
+        ImVec2 labelMax(labelX + labelSize.x + 4.0f, labelY + labelSize.y + 2.0f);
+        
+        bool labelHovered = (mousePos.x >= labelMin.x && mousePos.x <= labelMax.x &&
+                            mousePos.y >= labelMin.y && mousePos.y <= labelMax.y);
+        
+        // Check if we're currently renaming this track
+        if (renamingTrackIndex_ == static_cast<int>(i)) {
+            // Show input field for renaming
+            ImGui::SetCursorScreenPos(ImVec2(contentStartX, labelY - 2.0f));
+            ImGui::PushItemWidth(contentWidth);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.15f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+            
+            char inputId[32];
+            snprintf(inputId, sizeof(inputId), "##rename_%zu", i);
+            
+            if (ImGui::InputText(inputId, trackRenameBuffer_, sizeof(trackRenameBuffer_), 
+                                ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll)) {
+                // Enter pressed - save name
+                tracks_[i].name = trackRenameBuffer_;
+                renamingTrackIndex_ = -1;
+                markDirty();
+            }
+            
+            // Set focus on first frame
+            if (ImGui::IsItemVisible() && !ImGui::IsItemActive()) {
+                ImGui::SetKeyboardFocusHere(-1);
+            }
+            
+            // Cancel on Escape or click outside
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape) || 
+                (ImGui::IsMouseClicked(0) && !ImGui::IsItemHovered())) {
+                renamingTrackIndex_ = -1;
+            }
+            
+            ImGui::PopStyleColor(2);
+            ImGui::PopItemWidth();
+        } else {
+            // Draw label normally
+            if (labelHovered) {
+                // Subtle highlight on hover
+                drawList->AddRectFilled(labelMin, labelMax, IM_COL32(60, 60, 60, 100), 2.0f);
+            }
+            drawList->AddText(ImVec2(labelX, labelY), 
+                             IM_COL32(200, 200, 200, 255), trackLabel);
+            
+            // Double-click to rename
+            if (labelHovered && ImGui::IsMouseDoubleClicked(0)) {
+                renamingTrackIndex_ = static_cast<int>(i);
+                strncpy(trackRenameBuffer_, trackLabel, sizeof(trackRenameBuffer_) - 1);
+                trackRenameBuffer_[sizeof(trackRenameBuffer_) - 1] = '\0';
+            }
+        }
+        
+        // Button row: S M ● - CENTERED at bottom
+        float buttonRowY = headerStartPos.y + headerHeight - buttonSize - 6.0f;
+        float totalButtonWidth = buttonSize * 3 + buttonSpacing * 2;
+        float buttonX = contentCenterX - totalButtonWidth / 2.0f;
         
         // Solo button (S)
         ImVec2 soloMin(buttonX, buttonRowY);
@@ -1681,10 +2327,9 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
             tracks_[i].isRecording = !tracks_[i].isRecording;
         }
         
-        // Level meter (vertical bar on right side of track header)
-        float meterWidth = 6.0f;
+        // Level meter (vertical bar on right side of track header - flush with edge)
         float meterHeight = headerHeight - 8.0f;
-        float meterX = headerStartPos.x + columnWidth - meterWidth - 8.0f;
+        float meterX = headerStartPos.x + columnWidth - meterWidth - 2.0f;
         float meterY = headerStartPos.y + 4.0f;
         
         // Meter background
@@ -1729,21 +2374,33 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
                              IM_COL32(255, 255, 255, 200), 1.0f);
         }
         
-        // Close button (X) - only if more than 1 track
+        // Close button (X) - top right corner, only if more than 1 track
+        // Use ImGui's proper widget system for reliable clicks
+        bool closeClicked = false;
         if (tracks_.size() > 1) {
-            float closeX = headerStartPos.x + columnWidth - 24.0f;
+            float closeX = headerStartPos.x + columnWidth - meterWidth - 24.0f;
             float closeY = headerStartPos.y + 4.0f;
-            ImVec2 closeMin(closeX, closeY);
-            ImVec2 closeMax(closeX + 16.0f, closeY + 16.0f);
-            bool closeHovered = (mousePos.x >= closeMin.x && mousePos.x <= closeMax.x &&
-                                mousePos.y >= closeMin.y && mousePos.y <= closeMax.y);
             
-            if (closeHovered) {
-                drawList->AddRectFilled(closeMin, closeMax, IM_COL32(255, 94, 94, 100), 2.0f);
+            // Save cursor, position for button, then restore
+            ImVec2 savedCursor = ImGui::GetCursorScreenPos();
+            ImGui::SetCursorScreenPos(ImVec2(closeX, closeY));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.37f, 0.37f, 0.6f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.37f, 0.37f, 0.8f));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 2.0f);
+            
+            char closeBtnId[32];
+            snprintf(closeBtnId, sizeof(closeBtnId), "##close_%zu", i);
+            if (ImGui::Button("x", ImVec2(18.0f, 18.0f))) {
+                closeClicked = true;
             }
-            drawList->AddText(ImVec2(closeX + 3.0f, closeY), IM_COL32(150, 150, 150, 255), "x");
             
-            if (closeHovered && ImGui::IsMouseClicked(0)) {
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(3);
+            ImGui::SetCursorScreenPos(savedCursor);
+            
+            // Handle close button click
+            if (closeClicked) {
                 tracks_.erase(tracks_.begin() + i);
                 if (selectedTrackIndex_ >= tracks_.size() && !tracks_.empty()) {
                     selectedTrackIndex_ = tracks_.size() - 1;
@@ -1756,27 +2413,128 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
             }
         }
         
-        // Bottom border
-        drawList->AddLine(ImVec2(headerStartPos.x, headerStartPos.y + headerHeight - 1),
-                         ImVec2(headerStartPos.x + columnWidth, headerStartPos.y + headerHeight - 1),
-                         IM_COL32(55, 55, 55, 255));
+        // Thin 1px separator line at bottom (like Ableton)
+        drawList->AddLine(ImVec2(headerStartPos.x, headerStartPos.y + headerHeight),
+                         ImVec2(headerStartPos.x + columnWidth, headerStartPos.y + headerHeight),
+                         IM_COL32(25, 25, 25, 255));
         
-        // Invisible button for interaction
+        // Invisible button for interaction - exact height to avoid gaps
         ImGui::Dummy(ImVec2(columnWidth, headerHeight));
         
-        // Track selection on click
+        // Track selection on click (check we're not on any button)
         if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(0)) {
-            // Check if click wasn't on any button
             bool clickedButton = soloHovered || muteHovered || armHovered;
-            if (tracks_.size() > 1) {
-                float closeX = headerStartPos.x + columnWidth - 24.0f;
-                float closeY = headerStartPos.y + 4.0f;
-                clickedButton = clickedButton || (mousePos.x >= closeX && mousePos.x <= closeX + 16.0f &&
-                               mousePos.y >= closeY && mousePos.y <= closeY + 16.0f);
-            }
             if (!clickedButton) {
                 selectedTrackIndex_ = i;
             }
+        }
+        
+        // Right-click context menu for track
+        if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(1)) {
+            selectedTrackIndex_ = i;
+            ImGui::OpenPopup("track_context_menu");
+        }
+        
+        if (ImGui::BeginPopup("track_context_menu")) {
+            // Rename option
+            if (ImGui::MenuItem("Rename Track")) {
+                renamingTrackIndex_ = static_cast<int>(i);
+                if (!tracks_[i].name.empty()) {
+                    strncpy(trackRenameBuffer_, tracks_[i].name.c_str(), sizeof(trackRenameBuffer_) - 1);
+                } else {
+                    snprintf(trackRenameBuffer_, sizeof(trackRenameBuffer_), "Track %zu", i + 1);
+                }
+                trackRenameBuffer_[sizeof(trackRenameBuffer_) - 1] = '\0';
+            }
+            
+            ImGui::Separator();
+            
+            // Color picker submenu
+            if (ImGui::BeginMenu("Track Color")) {
+                // Nice 6x4 color grid (24 colors in HSL gradient)
+                static const ImU32 colorPalette[24] = {
+                    // Row 1: Saturated (warm to cool)
+                    IM_COL32(255, 149, 0, 255),   IM_COL32(255, 94, 94, 255),
+                    IM_COL32(255, 94, 153, 255),  IM_COL32(219, 103, 186, 255),
+                    IM_COL32(179, 102, 219, 255), IM_COL32(138, 103, 219, 255),
+                    // Row 2: Saturated (cool to warm)
+                    IM_COL32(102, 128, 219, 255), IM_COL32(51, 153, 219, 255),
+                    IM_COL32(51, 179, 204, 255),  IM_COL32(0, 199, 140, 255),
+                    IM_COL32(79, 199, 102, 255),  IM_COL32(132, 214, 79, 255),
+                    // Row 3: Pastels (warm to cool)
+                    IM_COL32(255, 179, 102, 255), IM_COL32(255, 128, 128, 255),
+                    IM_COL32(255, 153, 187, 255), IM_COL32(230, 153, 204, 255),
+                    IM_COL32(204, 153, 230, 255), IM_COL32(179, 153, 230, 255),
+                    // Row 4: Pastels (cool to warm)
+                    IM_COL32(153, 170, 230, 255), IM_COL32(128, 191, 230, 255),
+                    IM_COL32(128, 217, 217, 255), IM_COL32(102, 217, 191, 255),
+                    IM_COL32(153, 230, 153, 255), IM_COL32(255, 230, 102, 255)
+                };
+                
+                ImDrawList* menuDrawList = ImGui::GetWindowDrawList();
+                float colorSize = 22.0f;
+                float spacing = 3.0f;
+                
+                for (int row = 0; row < 4; row++) {
+                    for (int col = 0; col < 6; col++) {
+                        int colorIdx = row * 6 + col;
+                        
+                        if (col > 0) ImGui::SameLine();
+                        
+                        char btnId[16];
+                        snprintf(btnId, sizeof(btnId), "##col%d", colorIdx);
+                        
+                        ImVec2 btnPos = ImGui::GetCursorScreenPos();
+                        
+                        // Draw color swatch button
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::ColorConvertU32ToFloat4(colorPalette[colorIdx]));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::ColorConvertU32ToFloat4(
+                            IM_COL32(
+                                std::min(255, (int)((colorPalette[colorIdx] & 0xFF) * 1.2f)),
+                                std::min(255, (int)(((colorPalette[colorIdx] >> 8) & 0xFF) * 1.2f)),
+                                std::min(255, (int)(((colorPalette[colorIdx] >> 16) & 0xFF) * 1.2f)),
+                                255
+                            )
+                        ));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::ColorConvertU32ToFloat4(colorPalette[colorIdx]));
+                        
+                        if (ImGui::Button(btnId, ImVec2(colorSize, colorSize))) {
+                            tracks_[i].colorIndex = colorIdx;
+                            markDirty();
+                            ImGui::CloseCurrentPopup();
+                        }
+                        
+                        ImGui::PopStyleColor(3);
+                        
+                        // Draw selection indicator if this is current color
+                        if (tracks_[i].colorIndex == colorIdx) {
+                            menuDrawList->AddRect(
+                                btnPos, 
+                                ImVec2(btnPos.x + colorSize, btnPos.y + colorSize),
+                                IM_COL32(255, 255, 255, 255), 0.0f, 0, 2.0f
+                            );
+                        }
+                    }
+                }
+                
+                ImGui::EndMenu();
+            }
+            
+            ImGui::Separator();
+            
+            // Delete option
+            if (ImGui::MenuItem("Delete Track", nullptr, false, tracks_.size() > 1)) {
+                tracks_.erase(tracks_.begin() + i);
+                if (selectedTrackIndex_ >= tracks_.size()) {
+                    selectedTrackIndex_ = tracks_.size() - 1;
+                }
+                markDirty();
+                ImGui::EndPopup();
+                ImGui::PopID();
+                ImGui::NextColumn();
+                continue;
+            }
+            ImGui::EndPopup();
         }
         
         // Drop target for waveforms and instruments
@@ -1821,6 +2579,68 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
                     }
                 }
             }
+            // Accept effect preset drops on track headers
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("EFFECT_PRESET")) {
+                if (payload->DataSize == sizeof(int) * 2) {
+                    int* data = (int*)payload->Data;
+                    int effectType = data[0];
+                    int presetIdx = data[1];
+                    double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                    std::shared_ptr<Effect> newEffect;
+                    
+                    switch (effectType) {
+                        case 0: {
+                            auto reverb = std::make_shared<Reverb>(sampleRate);
+                            reverb->loadPreset(static_cast<Reverb::Preset>(presetIdx));
+                            newEffect = reverb;
+                            break;
+                        }
+                        case 1: {
+                            auto chorus = std::make_shared<Chorus>(sampleRate);
+                            chorus->loadPreset(static_cast<Chorus::Preset>(presetIdx));
+                            newEffect = chorus;
+                            break;
+                        }
+                        case 2: {
+                            auto distortion = std::make_shared<Distortion>(sampleRate);
+                            distortion->loadPreset(static_cast<Distortion::Preset>(presetIdx));
+                            newEffect = distortion;
+                            break;
+                        }
+                    }
+                    
+                    if (newEffect) {
+                        tracks_[i].effects.push_back(newEffect);
+                        selectedTrackIndex_ = i;
+                        markDirty();
+                    }
+                }
+            }
+            // Accept Sampler drops on track headers
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("SIMPLER")) {
+                tracks_[i].hasSampler = true;
+                tracks_[i].samplerSamplePath = "";
+                tracks_[i].samplerWaveform.clear();
+                tracks_[i].oscillators.clear();  // Clear oscillators when loading sampler
+                tracks_[i].instrumentName = "Sampler";
+                selectedTrackIndex_ = i;
+                markDirty();
+            }
+            // Accept Sample drops on track headers (load sample into Sampler)
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("SAMPLE")) {
+                if (payload->DataSize == sizeof(size_t)) {
+                    size_t sampleIdx = *(size_t*)payload->Data;
+                    if (sampleIdx < userSamples_.size()) {
+                        tracks_[i].hasSampler = true;
+                        tracks_[i].samplerSamplePath = userSamples_[sampleIdx].path;
+                        tracks_[i].samplerWaveform = userSamples_[sampleIdx].waveformDisplay;
+                        tracks_[i].oscillators.clear();  // Clear oscillators when loading sample
+                        tracks_[i].instrumentName = "Sampler: " + userSamples_[sampleIdx].name;
+                        selectedTrackIndex_ = i;
+                        markDirty();
+                    }
+                }
+            }
             ImGui::EndDragDropTarget();
         }
         
@@ -1832,12 +2652,53 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
         ImGui::PopID();
     }
     
-    // Add Track button
-    ImGui::Spacing();
+    // Fill remaining vertical space with grid continuation (timeline continues below tracks)
+    ImVec2 remainingPos = ImGui::GetCursorScreenPos();
+    float remainingHeight = ImGui::GetContentRegionAvail().y - 40.0f;  // Leave room for Add Track button
+    
+    if (remainingHeight > 0) {
+        // Draw dark grid background for remaining space in both columns
+        float leftColumnWidth = ImGui::GetColumnWidth(0);
+        
+        // Left column empty continuation
+        drawList->AddRectFilled(remainingPos, 
+                               ImVec2(remainingPos.x + leftColumnWidth, remainingPos.y + remainingHeight),
+                               IM_COL32(28, 28, 28, 255));
+        
+        // Right column timeline grid continuation
+        ImGui::NextColumn();
+        ImVec2 timelinePos = ImGui::GetCursorScreenPos();
+        float timelineWidth = ImGui::GetContentRegionAvail().x;
+        
+        // Dark background
+        drawList->AddRectFilled(timelinePos,
+                               ImVec2(timelinePos.x + timelineWidth, timelinePos.y + remainingHeight),
+                               IM_COL32(22, 22, 22, 255));
+        
+        // Draw vertical grid lines to continue the timeline
+        const float pixelsPerBeat = 50.0f;
+        float visibleBeats = timelineWidth / pixelsPerBeat;
+        float startBeat = std::floor(timelineScrollX_ / pixelsPerBeat);
+        float endBeat = startBeat + visibleBeats + 1.0f;
+        
+        for (float beat = startBeat; beat <= endBeat; beat += 1.0f) {
+            float x = timelinePos.x + (beat * pixelsPerBeat) - timelineScrollX_;
+            if (x >= timelinePos.x && x <= timelinePos.x + timelineWidth) {
+                bool isBar = (static_cast<int>(beat) % 4 == 0);
+                ImU32 lineColor = isBar ? IM_COL32(50, 50, 50, 255) : IM_COL32(35, 35, 35, 255);
+                drawList->AddLine(ImVec2(x, timelinePos.y),
+                                 ImVec2(x, timelinePos.y + remainingHeight), lineColor);
+            }
+        }
+        
+        ImGui::NextColumn();
+    }
+    
+    // Add Track button - CENTERED in column
     float addColumnWidth = ImGui::GetColumnWidth(0);
+    ImVec2 addBtnSize(addColumnWidth - 32.0f, 28.0f);  // Slightly narrower for better centering
     ImVec2 addBtnPos = ImGui::GetCursorScreenPos();
-    ImVec2 addBtnSize(addColumnWidth - 16.0f, 28.0f);
-    addBtnPos.x += 8.0f;
+    addBtnPos.x += (addColumnWidth - addBtnSize.x) / 2.0f;  // Center horizontally
     
     ImVec2 addMousePos = ImGui::GetMousePos();
     bool addHovered = (addMousePos.x >= addBtnPos.x && addMousePos.x <= addBtnPos.x + addBtnSize.x &&
@@ -1857,7 +2718,7 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
     
     if (addHovered && ImGui::IsMouseClicked(0)) {
         Track newTrack;
-        newTrack.colorIndex = static_cast<int>(tracks_.size() % 16);
+        newTrack.colorIndex = static_cast<int>(tracks_.size() % 24);
         newTrack.synth = std::make_shared<Synthesizer>(engine_->getSampleRate());
         newTrack.synth->setVolume(0.5f);
         newTrack.synth->setOscillators(newTrack.oscillators);
@@ -1885,17 +2746,17 @@ void MainWindow::initializeCommonDirectories() {
     if (homeDir) {
         fs::path homePath(homeDir);
         
-        // Add home directory
-        commonDirectories_.push_back({"🏠 Home", homePath.string()});
+        // Add home directory (using text labels - no emoji as ImGui font doesn't support them)
+        commonDirectories_.push_back({"Home", homePath.string()});
         
         // Add common subdirectories if they exist
         std::vector<std::pair<std::string, std::string>> commonDirs = {
-            {"📄 Documents", (homePath / "Documents").string()},
-            {"⬇️ Downloads", (homePath / "Downloads").string()},
-            {"🎵 Music", (homePath / "Music").string()},
-            {"🖼️ Pictures", (homePath / "Pictures").string()},
-            {"🎬 Videos", (homePath / "Videos").string()},
-            {"🖥️ Desktop", (homePath / "Desktop").string()}
+            {"Documents", (homePath / "Documents").string()},
+            {"Downloads", (homePath / "Downloads").string()},
+            {"Music", (homePath / "Music").string()},
+            {"Pictures", (homePath / "Pictures").string()},
+            {"Videos", (homePath / "Videos").string()},
+            {"Desktop", (homePath / "Desktop").string()}
         };
         
         for (const auto& [name, path] : commonDirs) {
@@ -1906,7 +2767,7 @@ void MainWindow::initializeCommonDirectories() {
     }
     
     // Add root directory
-    commonDirectories_.push_back({"💾 Root", "/"});
+    commonDirectories_.push_back({"Root /", "/"});
 }
 
 void MainWindow::updateFileBrowser(const std::string& path) {
@@ -2345,16 +3206,154 @@ void MainWindow::renderTransportControls() {
     float buttonAreaWidth = 200.0f;  // Width for all four buttons
     float centerX = windowWidth / 2.0f;
     
-    // Position BPM controls to the left of center
+    // Position display to the left of BPM
+    float posWidth = 100.0f;  // Position display width
     float bpmWidth = 150.0f;  // Total width for "BPM:" + input
-    float bpmStartX = centerX - buttonAreaWidth / 2.0f - bpmWidth - 20.0f;  // 20px gap before buttons
+    float posStartX = centerX - buttonAreaWidth / 2.0f - bpmWidth - posWidth - 40.0f;
     
-    ImGui::SetCursorPosX(bpmStartX);
+    ImGui::SetCursorPosX(posStartX);
     
-    // Vertically center the text and button
+    // Vertically center content
     float textHeight = ImGui::GetTextLineHeight();
     float buttonHeight = 30.0f;
     float verticalOffset = (buttonHeight - textHeight) / 2.0f;
+    
+    // Timeline position display (editable/draggable)
+    static bool posEditing = false;
+    static char posInput[32] = "";
+    static bool posDragging = false;
+    static float posDragStartX = 0.0f;
+    static float posDragStartValue = 0.0f;
+    
+    float currentPos;
+    {
+        std::lock_guard<std::mutex> lock(timelineMutex_);
+        currentPos = timelinePosition_;
+    }
+    
+    // Convert beats to bar.beat.subdivision format (4 beats per bar, 4 subdivisions per beat)
+    int bars = static_cast<int>(currentPos / 4.0f) + 1;
+    float beatsInBar = std::fmod(currentPos, 4.0f);
+    int beats = static_cast<int>(beatsInBar) + 1;
+    float subBeatFraction = std::fmod(beatsInBar, 1.0f);
+    int subdivision = static_cast<int>(subBeatFraction * 4.0f) + 1;  // 1-4 subdivisions per beat
+    
+    ImGui::PushID("position");
+    ImGui::SetNextItemWidth(90.0f);  // Slightly wider for new format
+    
+    if (posEditing) {
+        // Text input mode
+        if (ImGui::InputText("##pos_input", posInput, sizeof(posInput),
+                             ImGuiInputTextFlags_EnterReturnsTrue)) {
+            // Parse bar.beat.subdivision or bar.beat or just beats
+            int newBar = 1, newBeat = 1, newSub = 1;
+            if (sscanf(posInput, "%d.%d.%d", &newBar, &newBeat, &newSub) == 3) {
+                float newPos = (newBar - 1) * 4.0f + (newBeat - 1) + (newSub - 1) * 0.25f;
+                if (newPos >= 0.0f) {
+                    std::lock_guard<std::mutex> lock(timelineMutex_);
+                    timelinePosition_ = newPos;
+                    double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                    float beatsPerSecond = bpm_ / 60.0f;
+                    playbackSamplePosition_ = static_cast<int64_t>(newPos / beatsPerSecond * sampleRate);
+                }
+            } else if (sscanf(posInput, "%d.%d", &newBar, &newBeat) == 2) {
+                float newPos = (newBar - 1) * 4.0f + (newBeat - 1);
+                if (newPos >= 0.0f) {
+                    std::lock_guard<std::mutex> lock(timelineMutex_);
+                    timelinePosition_ = newPos;
+                    double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                    float beatsPerSecond = bpm_ / 60.0f;
+                    playbackSamplePosition_ = static_cast<int64_t>(newPos / beatsPerSecond * sampleRate);
+                }
+            } else {
+                float newPos = std::atof(posInput);
+                if (newPos >= 0.0f) {
+                    std::lock_guard<std::mutex> lock(timelineMutex_);
+                    timelinePosition_ = newPos;
+                    double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                    float beatsPerSecond = bpm_ / 60.0f;
+                    playbackSamplePosition_ = static_cast<int64_t>(newPos / beatsPerSecond * sampleRate);
+                }
+            }
+            posEditing = false;
+            posInput[0] = '\0';
+        }
+        if (!ImGui::IsItemActive() && ImGui::IsMouseClicked(0)) {
+            posEditing = false;
+            posInput[0] = '\0';
+        }
+    } else {
+        // Display mode - bar.beat.subdivision format
+        char posDisplay[32];
+        snprintf(posDisplay, sizeof(posDisplay), "%d.%d.%d", bars, beats, subdivision);
+        
+        ImGui::Button(posDisplay, ImVec2(80.0f, buttonHeight));
+        bool wasHovered = ImGui::IsItemHovered();
+        
+        // Handle dragging
+        if (posDragging) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            
+            float dragDelta = ImGui::GetMousePos().x - posDragStartX;
+            float beatsDelta = dragDelta * 0.05f;  // ~20 pixels = 1 beat
+            float newPos = std::max(0.0f, posDragStartValue + beatsDelta);
+            
+            {
+                std::lock_guard<std::mutex> lock(timelineMutex_);
+                timelinePosition_ = newPos;
+            }
+            
+            // Update playback position if not playing
+            if (!isPlaying_) {
+                double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                float beatsPerSecond = bpm_ / 60.0f;
+                playbackSamplePosition_ = static_cast<int64_t>(newPos / beatsPerSecond * sampleRate);
+            }
+            
+            if (!ImGui::IsMouseDown(0)) {
+                posDragging = false;
+            }
+        } else {
+            if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0, 2.0f)) {
+                posDragging = true;
+                posDragStartX = ImGui::GetMousePos().x;
+                std::lock_guard<std::mutex> lock(timelineMutex_);
+                posDragStartValue = timelinePosition_;
+            }
+        }
+        
+        if (!posDragging && wasHovered) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            
+            if (ImGui::IsMouseDoubleClicked(0)) {
+                snprintf(posInput, sizeof(posInput), "%d.%d.%d", bars, beats, subdivision);
+                posEditing = true;
+            } else {
+                // Scroll to change position
+                float scroll = ImGui::GetIO().MouseWheel;
+                if (scroll != 0.0f) {
+                    float newPos = std::max(0.0f, currentPos + scroll * 0.5f);
+                    {
+                        std::lock_guard<std::mutex> lock(timelineMutex_);
+                        timelinePosition_ = newPos;
+                    }
+                    if (!isPlaying_) {
+                        double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                        float beatsPerSecond = bpm_ / 60.0f;
+                        playbackSamplePosition_ = static_cast<int64_t>(newPos / beatsPerSecond * sampleRate);
+                    }
+                }
+            }
+        }
+    }
+    ImGui::PopID();
+    
+    ImGui::SameLine();
+    
+    // Position BPM controls to the left of center
+    float bpmStartX = centerX - buttonAreaWidth / 2.0f - bpmWidth - 20.0f;
+    
+    ImGui::SetCursorPosX(bpmStartX);
     
     // BPM label - vertically centered
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + verticalOffset);
@@ -2673,9 +3672,12 @@ void MainWindow::renderTransportControls() {
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "%s", countText);
     }
     
-    // Master output meter (right side of transport)
+    // Master output meter (right side of transport - flush with edge)
+    float masterMeterWidth = 60.0f;
+    float masterMeterHeight = 14.0f;
+    float meterStartX = windowWidth - masterMeterWidth - 8.0f;  // 8px from right edge
+    
     ImGui::SameLine();
-    float meterStartX = windowWidth - 100.0f;
     ImGui::SetCursorPosX(meterStartX);
     
     // Update peak hold
@@ -2698,14 +3700,14 @@ void MainWindow::renderTransportControls() {
     
     // Draw stereo meter
     ImVec2 meterPos = ImGui::GetCursorScreenPos();
-    float meterWidth = 80.0f;
-    float meterHeight = 12.0f;
-    float channelHeight = 5.0f;
+    float channelHeight = 6.0f;
     float channelGap = 2.0f;
     
-    // Background
-    drawList->AddRectFilled(meterPos, ImVec2(meterPos.x + meterWidth, meterPos.y + meterHeight),
-                           IM_COL32(18, 18, 18, 255), 2.0f);
+    // Background - subtle border
+    drawList->AddRectFilled(meterPos, ImVec2(meterPos.x + masterMeterWidth, meterPos.y + masterMeterHeight),
+                           IM_COL32(12, 12, 12, 255), 2.0f);
+    drawList->AddRect(meterPos, ImVec2(meterPos.x + masterMeterWidth, meterPos.y + masterMeterHeight),
+                     IM_COL32(40, 40, 40, 255), 2.0f);
     
     // Left channel
     float levelL = std::min(1.0f, masterPeakL_);
@@ -2722,7 +3724,7 @@ void MainWindow::renderTransportControls() {
     if (levelL > 0.001f) {
         drawList->AddRectFilled(
             ImVec2(meterPos.x + 1, meterPos.y + 1),
-            ImVec2(meterPos.x + 1 + (meterWidth - 2) * levelL, meterPos.y + 1 + channelHeight),
+            ImVec2(meterPos.x + 1 + (masterMeterWidth - 2) * levelL, meterPos.y + 1 + channelHeight),
             getMeterColor(levelL), 1.0f);
     }
     
@@ -2730,33 +3732,25 @@ void MainWindow::renderTransportControls() {
     if (levelR > 0.001f) {
         drawList->AddRectFilled(
             ImVec2(meterPos.x + 1, meterPos.y + 1 + channelHeight + channelGap),
-            ImVec2(meterPos.x + 1 + (meterWidth - 2) * levelR, meterPos.y + 1 + channelHeight + channelGap + channelHeight),
+            ImVec2(meterPos.x + 1 + (masterMeterWidth - 2) * levelR, meterPos.y + 1 + channelHeight + channelGap + channelHeight),
             getMeterColor(levelR), 1.0f);
     }
     
     // Peak hold indicators
     if (masterPeakHoldL_ > 0.01f) {
-        float peakX = meterPos.x + 1 + (meterWidth - 2) * masterPeakHoldL_;
+        float peakX = meterPos.x + 1 + (masterMeterWidth - 2) * masterPeakHoldL_;
         drawList->AddLine(ImVec2(peakX, meterPos.y + 1),
                          ImVec2(peakX, meterPos.y + 1 + channelHeight),
                          IM_COL32(255, 255, 255, 200), 1.0f);
     }
     if (masterPeakHoldR_ > 0.01f) {
-        float peakX = meterPos.x + 1 + (meterWidth - 2) * masterPeakHoldR_;
+        float peakX = meterPos.x + 1 + (masterMeterWidth - 2) * masterPeakHoldR_;
         drawList->AddLine(ImVec2(peakX, meterPos.y + 1 + channelHeight + channelGap),
                          ImVec2(peakX, meterPos.y + 1 + channelHeight + channelGap + channelHeight),
                          IM_COL32(255, 255, 255, 200), 1.0f);
     }
     
-    // Meter scale marks
-    float mark70 = meterPos.x + 1 + (meterWidth - 2) * 0.7f;
-    float mark90 = meterPos.x + 1 + (meterWidth - 2) * 0.9f;
-    drawList->AddLine(ImVec2(mark70, meterPos.y), ImVec2(mark70, meterPos.y + meterHeight),
-                     IM_COL32(60, 60, 60, 255), 1.0f);
-    drawList->AddLine(ImVec2(mark90, meterPos.y), ImVec2(mark90, meterPos.y + meterHeight),
-                     IM_COL32(80, 60, 60, 255), 1.0f);
-    
-    ImGui::Dummy(ImVec2(meterWidth, meterHeight));
+    ImGui::Dummy(ImVec2(masterMeterWidth, masterMeterHeight));
     
     ImGui::End();
 #endif
@@ -2807,19 +3801,23 @@ void MainWindow::updateTimeline() {
 void MainWindow::renderTrackTimeline(size_t trackIndex) {
 #ifdef PAN_USE_GUI
     const float pixelsPerBeat = 50.0f;
-    const float timelineHeight = 64.0f;  // Match track header height
-    const float beatMarkerHeight = 18.0f;
+    const float timelineHeight = 60.0f;  // Match track header height
+    const float beatMarkerHeight = 16.0f;
     
-    // Track color palette (same as renderTracks)
-    static const ImU32 trackColors[16] = {
-        IM_COL32(255, 94, 94, 255),   IM_COL32(255, 149, 0, 255),
-        IM_COL32(255, 212, 0, 255),   IM_COL32(132, 214, 79, 255),
-        IM_COL32(0, 199, 140, 255),   IM_COL32(51, 153, 219, 255),
-        IM_COL32(138, 103, 219, 255), IM_COL32(219, 103, 186, 255),
-        IM_COL32(255, 128, 128, 255), IM_COL32(255, 179, 102, 255),
-        IM_COL32(255, 230, 102, 255), IM_COL32(179, 230, 128, 255),
-        IM_COL32(102, 217, 191, 255), IM_COL32(128, 191, 230, 255),
-        IM_COL32(179, 153, 230, 255), IM_COL32(230, 153, 204, 255)
+    // Track color palette (24 colors, same as renderTracks)
+    static const ImU32 trackColors[24] = {
+        IM_COL32(255, 149, 0, 255), IM_COL32(255, 94, 94, 255),
+        IM_COL32(255, 94, 153, 255), IM_COL32(219, 103, 186, 255),
+        IM_COL32(179, 102, 219, 255), IM_COL32(138, 103, 219, 255),
+        IM_COL32(102, 128, 219, 255), IM_COL32(51, 153, 219, 255),
+        IM_COL32(51, 179, 204, 255), IM_COL32(0, 199, 140, 255),
+        IM_COL32(79, 199, 102, 255), IM_COL32(132, 214, 79, 255),
+        IM_COL32(255, 179, 102, 255), IM_COL32(255, 128, 128, 255),
+        IM_COL32(255, 153, 187, 255), IM_COL32(230, 153, 204, 255),
+        IM_COL32(204, 153, 230, 255), IM_COL32(179, 153, 230, 255),
+        IM_COL32(153, 170, 230, 255), IM_COL32(128, 191, 230, 255),
+        IM_COL32(128, 217, 217, 255), IM_COL32(102, 217, 191, 255),
+        IM_COL32(153, 230, 153, 255), IM_COL32(255, 230, 102, 255)
     };
     
     ImDrawList* drawList = ImGui::GetWindowDrawList();
@@ -2828,7 +3826,7 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
     canvasSize.x = std::max(canvasSize.x, 600.0f);
     canvasSize.y = timelineHeight;
     
-    int trackColorIdx = tracks_[trackIndex].colorIndex % 16;
+    int trackColorIdx = tracks_[trackIndex].colorIndex % 24;
     
     // Dark timeline background
     drawList->AddRectFilled(canvasPos, ImVec2(canvasPos.x + canvasSize.x, canvasPos.y + canvasSize.y),
@@ -3039,9 +4037,53 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
         );
     }
     
-    // Set cursor for scrolling
-    ImGui::SetCursorScreenPos(ImVec2(canvasPos.x, canvasPos.y + canvasSize.y));
+    // Thin 1px separator line at bottom of timeline (visual divider between tracks)
+    drawList->AddLine(ImVec2(canvasPos.x, canvasPos.y + canvasSize.y - 1),
+                     ImVec2(canvasPos.x + canvasSize.x, canvasPos.y + canvasSize.y - 1),
+                     IM_COL32(15, 15, 15, 255));
+    
+    // Set cursor at TOP of canvas for interaction, then InvisibleButton advances cursor correctly
+    ImGui::SetCursorScreenPos(canvasPos);
     ImGui::InvisibleButton("timeline_canvas", canvasSize);
+    
+    // Handle playhead dragging on timeline (click or drag to set position)
+    static bool timelineDragging = false;
+    if (ImGui::IsItemHovered() || timelineDragging) {
+        ImVec2 mousePos = ImGui::GetMousePos();
+        
+        // Check if near the playhead or on the ruler area (top 20 pixels)
+        bool nearPlayhead = std::abs(mousePos.x - playheadX) < 10.0f;
+        bool onRuler = (mousePos.y - canvasPos.y) < 20.0f;
+        
+        if (nearPlayhead || onRuler) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        }
+        
+        // Start dragging on click in ruler area or on playhead
+        if (ImGui::IsMouseClicked(0) && (nearPlayhead || onRuler)) {
+            timelineDragging = true;
+        }
+        
+        // Update position while dragging
+        if (timelineDragging) {
+            float newBeat = (mousePos.x - canvasPos.x + timelineScrollX_) / pixelsPerBeat;
+            newBeat = std::max(0.0f, newBeat);
+            
+            {
+                std::lock_guard<std::mutex> lock(timelineMutex_);
+                timelinePosition_ = newBeat;
+            }
+            
+            // Update playback sample position
+            double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+            float beatsPerSecond = bpm_ / 60.0f;
+            playbackSamplePosition_ = static_cast<int64_t>(newBeat / beatsPerSecond * sampleRate);
+            
+            if (!ImGui::IsMouseDown(0)) {
+                timelineDragging = false;
+            }
+        }
+    }
     
     // Handle horizontal scrolling with mouse wheel (only on first track to avoid conflicts)
     if (trackIndex == 0 && ImGui::IsItemHovered()) {
@@ -3544,28 +4586,36 @@ void MainWindow::renderPianoRoll() {
         }
     }
     
-    // Get track color for notes (Ableton-style: notes inherit track color)
-    static const ImU32 trackColors[16] = {
-        IM_COL32(255, 94, 94, 255),   // Red
-        IM_COL32(255, 149, 0, 255),   // Orange  
-        IM_COL32(255, 212, 0, 255),   // Yellow
-        IM_COL32(132, 214, 79, 255),  // Lime
-        IM_COL32(0, 199, 140, 255),   // Teal
-        IM_COL32(51, 153, 219, 255),  // Blue
-        IM_COL32(138, 103, 219, 255), // Purple
-        IM_COL32(219, 103, 186, 255), // Pink
-        IM_COL32(255, 128, 128, 255), // Light red
-        IM_COL32(255, 179, 102, 255), // Peach
-        IM_COL32(255, 230, 102, 255), // Light yellow
-        IM_COL32(179, 230, 128, 255), // Light lime
-        IM_COL32(102, 217, 191, 255), // Light teal
-        IM_COL32(128, 191, 230, 255), // Light blue
-        IM_COL32(179, 153, 230, 255), // Light purple
-        IM_COL32(230, 153, 204, 255)  // Light pink
+    // Get track color for notes (Ableton-style: notes inherit track color - 24 colors)
+    static const ImU32 trackColors[24] = {
+        IM_COL32(255, 149, 0, 255),   // 0: Orange (playhead color)
+        IM_COL32(255, 94, 94, 255),   // 1: Red
+        IM_COL32(255, 94, 153, 255),  // 2: Rose
+        IM_COL32(219, 103, 186, 255), // 3: Pink
+        IM_COL32(179, 102, 219, 255), // 4: Magenta
+        IM_COL32(138, 103, 219, 255), // 5: Purple
+        IM_COL32(102, 128, 219, 255), // 6: Indigo
+        IM_COL32(51, 153, 219, 255),  // 7: Blue
+        IM_COL32(51, 179, 204, 255),  // 8: Cyan
+        IM_COL32(0, 199, 140, 255),   // 9: Teal
+        IM_COL32(79, 199, 102, 255),  // 10: Green
+        IM_COL32(132, 214, 79, 255),  // 11: Lime
+        IM_COL32(255, 179, 102, 255), // 12: Peach
+        IM_COL32(255, 128, 128, 255), // 13: Light red
+        IM_COL32(255, 153, 187, 255), // 14: Light rose
+        IM_COL32(230, 153, 204, 255), // 15: Light pink
+        IM_COL32(204, 153, 230, 255), // 16: Light magenta
+        IM_COL32(179, 153, 230, 255), // 17: Light purple
+        IM_COL32(153, 170, 230, 255), // 18: Light indigo
+        IM_COL32(128, 191, 230, 255), // 19: Light blue
+        IM_COL32(128, 217, 217, 255), // 20: Light cyan
+        IM_COL32(102, 217, 191, 255), // 21: Light teal
+        IM_COL32(153, 230, 153, 255), // 22: Light green
+        IM_COL32(255, 230, 102, 255)  // 23: Light yellow
     };
     
     int trackColorIdx = (selectedTrackIndex_ < tracks_.size()) ? tracks_[selectedTrackIndex_].colorIndex : 0;
-    ImU32 baseNoteColor = trackColors[trackColorIdx % 16];
+    ImU32 baseNoteColor = trackColors[trackColorIdx % 24];
     
     // Draw all notes with rounded corners
     for (const auto& note : noteRects) {
@@ -4212,8 +5262,10 @@ void MainWindow::renderPianoRoll() {
         }
     }
     
-    // Set draw tool cursor when active
-    if (pencilToolActive_ && mouseOverCanvas && !drawingNote_.isDrawing) {
+    // Set draw tool cursor when active - ONLY within piano roll window AND canvas
+    // Must check both IsWindowHovered (mouse over Piano Roll window) AND mouseOverCanvas (over grid area)
+    bool pianoRollWindowHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+    if (pencilToolActive_ && pianoRollWindowHovered && mouseOverCanvas && !drawingNote_.isDrawing) {
         // Hide the default cursor and draw custom icon
         ImGui::SetMouseCursor(ImGuiMouseCursor_None);
         
@@ -4228,6 +5280,7 @@ void MainWindow::renderPianoRoll() {
                               ImVec2(iconPos.x + drawIconWidth_, iconPos.y + drawIconHeight_));
         }
     }
+    // Note: Arrow cursor is set at frame start when pencilToolActive_ is true
     
     // Handle 'Q' key for quantize
     if (pianoRollActive_ && ImGui::IsKeyPressed(ImGuiKey_Q) && !ImGui::GetIO().WantTextInput) {
@@ -4453,15 +5506,16 @@ void MainWindow::initializeInstrumentPresets() {
         }
     ));
     
-    // Hollow Pad - Odd harmonics only (subtractive filtering)
+    // Hollow Pad - Odd harmonics only create "hollow" nasal character
+    // Music theory: Square waves contain only odd harmonics (1, 3, 5, 7...)
     instrumentPresets_.push_back(InstrumentPreset(
         "Hollow Pad",
-        "Synth",
+        "Pad",  // Fixed: Pads belong in Pad category
         {
-            Oscillator(Waveform::Square, 1.0f, 0.6f),        // Square has odd harmonics
-            Oscillator(Waveform::Sine, 3.0f, 0.2f),          // 3rd harmonic
-            Oscillator(Waveform::Sine, 5.0f, 0.12f),         // 5th harmonic
-            Oscillator(Waveform::Sine, 7.0f, 0.08f)          // 7th harmonic (very weak)
+            Oscillator(Waveform::Square, 1.0f, 0.5f),        // Square has odd harmonics naturally
+            Oscillator(Waveform::Sine, 3.0f, 0.25f),         // Reinforce 3rd harmonic
+            Oscillator(Waveform::Sine, 5.0f, 0.15f),         // 5th harmonic
+            Oscillator(Waveform::Sine, 7.0f, 0.1f)           // 7th harmonic
         }
     ));
     
@@ -4477,15 +5531,20 @@ void MainWindow::initializeInstrumentPresets() {
         }
     ));
     
-    // Deep Bass - Sub-octave heavy (divisive/sub-oscillator)
+    // Deep Bass - Floor-shaking sub-bass (-1 octave from default)
+    // Plays an octave lower than MIDI note for maximum sub impact
     instrumentPresets_.push_back(InstrumentPreset(
         "Deep Bass",
-        "Synth",
+        "Bass",
         {
-            Oscillator(Waveform::Sine, 0.5f, 0.7f),          // Sub-octave
-            Oscillator(Waveform::Triangle, 1.0f, 0.5f),      // Fundamental
-            Oscillator(Waveform::Square, 1.0f, 0.25f),       // Add harmonics
-            Oscillator(Waveform::Sine, 0.25f, 0.15f)         // Two octaves down (sub-sub)
+            // Sub-bass core: -2 octaves (0.25x)
+            Oscillator(Waveform::Sine, 0.25f, 1.0f),
+            // Deep sub: -3 octaves for extreme rumble
+            Oscillator(Waveform::Sine, 0.125f, 0.7f),
+            // Low bass body: -1 octave
+            Oscillator(Waveform::Sine, 0.5f, 0.3f),
+            // Harmonic clarity: fundamental
+            Oscillator(Waveform::Sine, 1.0f, 0.15f)
         }
     ));
     
@@ -4537,6 +5596,208 @@ void MainWindow::initializeInstrumentPresets() {
             Oscillator(Waveform::Triangle, 1.0f, 0.3f),      // Warmth
             Oscillator(Waveform::Sine, 2.0f, 0.2f),          // 2nd harmonic only
             Oscillator(Waveform::Sine, 0.5f, 0.15f)          // Sub-octave for depth
+        }
+    ));
+    
+    // === BASS CATEGORY ===
+    
+    // Sub Bass - Optimized for maximum low-end (-1 octave from default)
+    // At C3 (130.8Hz MIDI), this plays at 32.7Hz (sub-bass sweet spot)
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Sub Bass",
+        "Bass",
+        {
+            // Primary sub layer: -2 octaves (0.25x)
+            Oscillator(Waveform::Sine, 0.25f, 0.9f),
+            // Harmonic layer: -1 octave for speaker audibility
+            Oscillator(Waveform::Sine, 0.5f, 0.25f),
+            // Presence layer: fundamental for note definition
+            Oscillator(Waveform::Triangle, 1.0f, 0.1f)
+        }
+    ));
+    
+    // Reese Bass - Detuned unison (-1 octave from default)
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Reese Bass",
+        "Bass",
+        {
+            Oscillator(Waveform::Sawtooth, 0.5f, 0.4f),
+            Oscillator(Waveform::Sawtooth, 0.4975f, 0.4f),   // Slightly detuned
+            Oscillator(Waveform::Sawtooth, 0.5025f, 0.4f),   // Slightly detuned
+            Oscillator(Waveform::Sine, 0.25f, 0.3f)          // Sub layer
+        }
+    ));
+    
+    // FM Bass - Classic DX7 style (-1 octave from default)
+    instrumentPresets_.push_back(InstrumentPreset(
+        "FM Bass",
+        "Bass",
+        {
+            Oscillator(Waveform::Sine, 0.5f, 0.6f),
+            Oscillator(Waveform::Sine, 1.0f, 0.35f),
+            Oscillator(Waveform::Sine, 1.75f, 0.2f),         // Inharmonic for "snap"
+            Oscillator(Waveform::Sine, 0.25f, 0.25f)
+        }
+    ));
+    
+    // Acid Bass - Square wave with harmonics (-1 octave from default)
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Acid Bass",
+        "Bass",
+        {
+            Oscillator(Waveform::Square, 0.5f, 0.5f),
+            Oscillator(Waveform::Sawtooth, 0.5f, 0.3f),
+            Oscillator(Waveform::Square, 0.25f, 0.2f)
+        }
+    ));
+    
+    // === PAD CATEGORY ===
+    
+    // Warm Pad - Soft even harmonics
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Warm Pad",
+        "Pad",
+        {
+            Oscillator(Waveform::Sine, 1.0f, 0.6f),
+            Oscillator(Waveform::Triangle, 1.0f, 0.3f),
+            Oscillator(Waveform::Sine, 2.0f, 0.2f),
+            Oscillator(Waveform::Sine, 0.5f, 0.15f)
+        }
+    ));
+    
+    // String Pad - Rich harmonics (additive)
+    instrumentPresets_.push_back(InstrumentPreset(
+        "String Pad",
+        "Pad",
+        {
+            Oscillator(Waveform::Sawtooth, 1.0f, 0.3f),
+            Oscillator(Waveform::Sawtooth, 0.998f, 0.3f),
+            Oscillator(Waveform::Sawtooth, 1.002f, 0.3f),
+            Oscillator(Waveform::Sine, 2.0f, 0.1f)
+        }
+    ));
+    
+    // Glass Pad - Ethereal
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Glass Pad",
+        "Pad",
+        {
+            Oscillator(Waveform::Sine, 1.0f, 0.5f),
+            Oscillator(Waveform::Sine, 3.0f, 0.25f),
+            Oscillator(Waveform::Sine, 5.0f, 0.15f),
+            Oscillator(Waveform::Triangle, 7.0f, 0.08f)
+        }
+    ));
+    
+    // === LEAD CATEGORY ===
+    
+    // Square Lead - Classic 8-bit
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Square Lead",
+        "Lead",
+        {
+            Oscillator(Waveform::Square, 1.0f, 0.6f),
+            Oscillator(Waveform::Square, 2.0f, 0.2f)
+        }
+    ));
+    
+    // Sync Lead - Bright and cutting
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Sync Lead",
+        "Lead",
+        {
+            Oscillator(Waveform::Sawtooth, 1.0f, 0.5f),
+            Oscillator(Waveform::Sawtooth, 2.0f, 0.4f),
+            Oscillator(Waveform::Sawtooth, 3.0f, 0.2f)
+        }
+    ));
+    
+    // PWM Lead - Pulse width mod simulation
+    instrumentPresets_.push_back(InstrumentPreset(
+        "PWM Lead",
+        "Lead",
+        {
+            Oscillator(Waveform::Square, 1.0f, 0.4f),
+            Oscillator(Waveform::Square, 1.01f, 0.3f),
+            Oscillator(Waveform::Square, 0.99f, 0.3f),
+            Oscillator(Waveform::Sine, 2.0f, 0.1f)
+        }
+    ));
+    
+    // === KEYS CATEGORY ===
+    
+    // Organ - Drawbar style (additive)
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Organ",
+        "Keys",
+        {
+            Oscillator(Waveform::Sine, 0.5f, 0.3f),          // 16'
+            Oscillator(Waveform::Sine, 1.0f, 0.5f),          // 8'
+            Oscillator(Waveform::Sine, 2.0f, 0.4f),          // 4'
+            Oscillator(Waveform::Sine, 3.0f, 0.25f),         // 2 2/3'
+            Oscillator(Waveform::Sine, 4.0f, 0.15f)          // 2'
+        }
+    ));
+    
+    // Clavinet - Funky keys
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Clavinet",
+        "Keys",
+        {
+            Oscillator(Waveform::Square, 1.0f, 0.5f),
+            Oscillator(Waveform::Sawtooth, 1.0f, 0.3f),
+            Oscillator(Waveform::Square, 2.0f, 0.2f),
+            Oscillator(Waveform::Sawtooth, 4.0f, 0.1f)
+        }
+    ));
+    
+    // Harpsichord - Bright pluck
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Harpsichord",
+        "Keys",
+        {
+            Oscillator(Waveform::Sawtooth, 1.0f, 0.4f),
+            Oscillator(Waveform::Sawtooth, 2.0f, 0.35f),
+            Oscillator(Waveform::Triangle, 3.0f, 0.2f),
+            Oscillator(Waveform::Sawtooth, 4.0f, 0.15f)
+        }
+    ));
+    
+    // === PLUCK CATEGORY ===
+    
+    // Pluck - Karplus-Strong style
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Pluck",
+        "Pluck",
+        {
+            Oscillator(Waveform::Triangle, 1.0f, 0.6f),
+            Oscillator(Waveform::Sine, 2.0f, 0.25f),
+            Oscillator(Waveform::Sine, 3.0f, 0.15f)
+        }
+    ));
+    
+    // Marimba - Wooden mallet percussion
+    // Music theory: Marimba bars are tuned so the 4:1 partial is exactly 2 octaves up
+    // Real marimba partials: 1.0, 4.0 (tuned), ~9.2 (natural 3rd mode)
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Marimba",
+        "Pluck",
+        {
+            Oscillator(Waveform::Sine, 1.0f, 0.7f),          // Fundamental
+            Oscillator(Waveform::Sine, 4.0f, 0.35f),         // 4:1 tuned partial (2 octaves up)
+            Oscillator(Waveform::Sine, 9.2f, 0.12f)          // Natural 3rd mode partial
+        }
+    ));
+    
+    // Kalimba - Thumb piano
+    instrumentPresets_.push_back(InstrumentPreset(
+        "Kalimba",
+        "Pluck",
+        {
+            Oscillator(Waveform::Sine, 1.0f, 0.6f),
+            Oscillator(Waveform::Sine, 3.0f, 0.3f),
+            Oscillator(Waveform::Sine, 5.0f, 0.15f),
+            Oscillator(Waveform::Triangle, 7.0f, 0.08f)
         }
     ));
     
@@ -4627,6 +5888,77 @@ void MainWindow::saveUserPresetsToFile() {
     
     file.close();
     std::cout << "Saved " << userPresets_.size() << " user presets to file" << std::endl;
+}
+
+void MainWindow::loadSamplesFromDirectory() {
+    userSamples_.clear();
+    
+    // Create samples directory if it doesn't exist
+    std::filesystem::create_directories("samples");
+    
+    // Scan for WAV files
+    try {
+        for (const auto& entry : std::filesystem::directory_iterator("samples")) {
+            if (entry.is_regular_file()) {
+                std::string ext = entry.path().extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                
+                if (ext == ".wav") {
+                    SampleInfo info;
+                    info.path = entry.path().string();
+                    info.name = entry.path().stem().string();
+                    
+                    // Load waveform preview using a temporary Sampler
+                    Sampler tempSampler(44100.0);
+                    if (tempSampler.loadSample(info.path)) {
+                        const Sample* sample = tempSampler.getSample();
+                        if (sample) {
+                            info.waveformDisplay = sample->waveformDisplay;
+                        }
+                    }
+                    
+                    userSamples_.push_back(info);
+                }
+            }
+        }
+        
+        std::cout << "Loaded " << userSamples_.size() << " samples from samples/" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error scanning samples directory: " << e.what() << std::endl;
+    }
+}
+
+void MainWindow::refreshSampleList() {
+    loadSamplesFromDirectory();
+}
+
+bool MainWindow::importSample(const std::string& sourcePath) {
+    // Create samples directory if it doesn't exist
+    std::filesystem::create_directories("samples");
+    
+    // Get filename from source path
+    std::filesystem::path srcPath(sourcePath);
+    std::string filename = srcPath.filename().string();
+    std::filesystem::path destPath = std::filesystem::path("samples") / filename;
+    
+    // Check if file already exists
+    if (std::filesystem::exists(destPath)) {
+        std::cout << "Sample already exists: " << filename << std::endl;
+        return true;  // Already imported
+    }
+    
+    // Copy the file
+    try {
+        std::filesystem::copy_file(srcPath, destPath);
+        std::cout << "Imported sample: " << filename << std::endl;
+        
+        // Refresh the sample list
+        refreshSampleList();
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to import sample: " << e.what() << std::endl;
+        return false;
+    }
 }
 
 } // namespace pan

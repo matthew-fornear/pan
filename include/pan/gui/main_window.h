@@ -33,6 +33,11 @@ struct Track {
     // Effects chain
     std::vector<std::shared_ptr<Effect>> effects;  // Audio effects applied to this track
     
+    // Sampler
+    bool hasSampler = false;  // Track has a sampler instrument
+    std::string samplerSamplePath;  // Path to loaded sample (empty = waiting for sample)
+    std::vector<float> samplerWaveform;  // Waveform display data for sampler
+    
     // MIDI recording
     std::shared_ptr<MidiClip> recordingClip;  // Current recording clip (null when not recording)
     std::vector<std::shared_ptr<MidiClip>> clips;  // All recorded clips for this track
@@ -56,6 +61,13 @@ struct InstrumentPreset {
     
     InstrumentPreset(const std::string& n, const std::string& cat, const std::vector<Oscillator>& oscs)
         : name(n), category(cat), oscillators(oscs) {}
+};
+
+// Sample info for browser display
+struct SampleInfo {
+    std::string name;
+    std::string path;
+    std::vector<float> waveformDisplay;  // For visualization
 };
 
 class MainWindow {
@@ -101,6 +113,12 @@ private:
     void saveUserPreset(const std::string& name, const std::vector<Oscillator>& oscillators);
     void loadUserPresets();  // Load user presets from file
     void saveUserPresetsToFile();  // Save user presets to file
+    
+    // Sample library
+    std::vector<SampleInfo> userSamples_;  // User-loaded samples
+    void loadSamplesFromDirectory();  // Load samples from samples/ directory
+    void refreshSampleList();  // Refresh the samples list
+    bool importSample(const std::string& sourcePath);  // Import sample to samples/
     float effectsScrollY_;  // Scroll position for effects panel
     
     // Master output metering
@@ -213,6 +231,10 @@ private:
     
     // Selected notes (clipIndex, eventIndex pairs)
     std::set<std::pair<size_t, size_t>> selectedNotes_;
+    
+    // Track renaming
+    int renamingTrackIndex_ = -1;  // -1 means not renaming
+    char trackRenameBuffer_[64] = "";
     
     void renderPianoRoll();
     void handlePianoRollInput();
