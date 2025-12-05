@@ -71,8 +71,9 @@ private:
     
     std::mutex mutex_;
     
-    // WAV loading helpers
+    // File loading helpers
     bool parseWavHeader(const std::vector<uint8_t>& data, int& channels, int& sampleRate, int& bitsPerSample, size_t& dataOffset, size_t& dataSize);
+    bool loadMp3(const std::string& path);
 };
 
 } // namespace pan

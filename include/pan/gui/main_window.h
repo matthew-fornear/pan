@@ -7,6 +7,7 @@
 #include <utility>
 #include "pan/audio/audio_engine.h"
 #include "pan/audio/effect.h"
+#include "pan/audio/sampler.h"
 #include "pan/midi/midi_input.h"
 #include "pan/midi/synthesizer.h"
 #include "pan/midi/midi_clip.h"
@@ -37,6 +38,7 @@ struct Track {
     bool hasSampler = false;  // Track has a sampler instrument
     std::string samplerSamplePath;  // Path to loaded sample (empty = waiting for sample)
     std::vector<float> samplerWaveform;  // Waveform display data for sampler
+    std::shared_ptr<Sampler> sampler;  // Actual sampler instance for audio playback
     
     // MIDI recording
     std::shared_ptr<MidiClip> recordingClip;  // Current recording clip (null when not recording)
@@ -84,6 +86,10 @@ public:
     void shutdown();
     void run();
     void requestQuit();  // Request shutdown (called by signal handlers)
+    
+    // OS file drop support (public for GLFW callback access)
+    std::vector<std::string> droppedFiles_;
+    std::mutex droppedFilesMutex_;
     
 private:
     bool initializeAudio();
@@ -156,6 +162,8 @@ private:
     bool isDraggingPlayhead_;  // Whether user is dragging the playhead
     float dragStartBeat_;  // Beat position when drag started
     int64_t playbackSamplePosition_;  // Current playback position in samples (for MIDI clip playback)
+    
+    void processDroppedFiles();  // Process files dropped from OS
     
     // Count-in feature
     bool countInEnabled_;  // Whether count-in is enabled
@@ -251,6 +259,7 @@ private:
     void renderTransportControls();
     void renderComponentBox(size_t trackIndex, size_t oscIndex, Oscillator& osc);
     void renderInstrumentPanel(size_t trackIndex);
+    void renderSamplerPanel(size_t trackIndex);
     void renderVelocityEditor(float canvasX, float canvasY, float canvasWidth, float canvasHeight);
     void renderEffectBox(size_t trackIndex, size_t effectIndex, std::shared_ptr<Effect> effect);
     void renderTrackTimeline(size_t trackIndex);

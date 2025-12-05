@@ -56,6 +56,9 @@ external/
 *.pan
 *.panproj
 
+# User samples directory
+samples/
+
 # Logs and temporary files
 *.log
 *.tmp
@@ -84,4 +87,3 @@ Testing/
 *.gcov
 *.gcda
 *.gcno
-

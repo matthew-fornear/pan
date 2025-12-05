@@ -93,6 +93,32 @@ static void glfw_error_callback(int error, const char* description) {
     std::cerr << "GLFW Error " << error << ": " << description << std::endl;
 }
 
+// Global pointer for GLFW callbacks
+static MainWindow* g_mainWindowInstance = nullptr;
+
+// GLFW drop callback for OS file drag-and-drop
+static void glfw_drop_callback(GLFWwindow* window, int count, const char** paths) {
+    std::cout << "[Drop] GLFW drop callback triggered with " << count << " files" << std::endl;
+    if (g_mainWindowInstance && count > 0) {
+        std::lock_guard<std::mutex> lock(g_mainWindowInstance->droppedFilesMutex_);
+        for (int i = 0; i < count; i++) {
+            std::string path(paths[i]);
+            std::cout << "[Drop] File " << i << ": " << path << std::endl;
+            std::string ext = std::filesystem::path(path).extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            // Accept WAV and MP3 files
+            if (ext == ".wav" || ext == ".mp3") {
+                g_mainWindowInstance->droppedFiles_.push_back(path);
+                std::cout << "[Drop] Accepted: " << path << std::endl;
+            } else {
+                std::cout << "[Drop] Rejected (only .wav/.mp3 supported): " << path << std::endl;
+            }
+        }
+    } else {
+        std::cout << "[Drop] No main window instance!" << std::endl;
+    }
+}
+
 MainWindow::MainWindow()
     : window_(nullptr)
     , shouldQuit_(false)
@@ -203,6 +229,10 @@ bool MainWindow::initialize() {
     }
     
     window_ = window;
+    
+    // Set up OS file drop callback
+    g_mainWindowInstance = this;
+    glfwSetDropCallback(window, glfw_drop_callback);
     
     // Load and set window icon
     // Try multiple paths: current directory, executable directory, or project root
@@ -558,7 +588,16 @@ bool MainWindow::initializeAudio() {
                             // If this event falls within the current buffer, trigger it
                             if (absoluteSamplePos >= currentPlaybackPos && 
                                 absoluteSamplePos < currentPlaybackPos + static_cast<int64_t>(numFrames)) {
-                                track.synth->processMidiMessage(event.message);
+                                // Route to sampler if track has one, otherwise to synth
+                                if (track.hasSampler && track.sampler) {
+                                    if (event.message.getType() == MidiMessageType::NoteOn) {
+                                        track.sampler->noteOn(event.message.getNoteNumber(), event.message.getVelocity());
+                                    } else if (event.message.getType() == MidiMessageType::NoteOff) {
+                                        track.sampler->noteOff(event.message.getNoteNumber());
+                                    }
+                                } else if (track.synth) {
+                                    track.synth->processMidiMessage(event.message);
+                                }
                             }
                         }
                     }
@@ -577,12 +616,20 @@ bool MainWindow::initializeAudio() {
         
         // Mix all recording tracks (armed tracks get live MIDI input)
         for (auto& track : tracks_) {
-            if (track.synth) {
+            if (track.synth || track.sampler) {
                 // Skip muted tracks, or non-soloed tracks when solo is active
                 bool shouldPlay = !track.isMuted && (!anySolo || track.isSolo);
                 
                 AudioBuffer trackBuffer(output.getNumChannels(), numFrames);
-                track.synth->generateAudio(trackBuffer, numFrames);
+                
+                // Use sampler for audio if track has sampler, otherwise use synth
+                if (track.hasSampler && track.sampler) {
+                    float* leftOut = trackBuffer.getWritePointer(0);
+                    float* rightOut = trackBuffer.getNumChannels() > 1 ? trackBuffer.getWritePointer(1) : leftOut;
+                    track.sampler->process(leftOut, rightOut, numFrames);
+                } else if (track.synth) {
+                    track.synth->generateAudio(trackBuffer, numFrames);
+                }
                 
                 // Apply effects chain
                 for (auto& effect : track.effects) {
@@ -697,8 +744,18 @@ bool MainWindow::initializeMIDI() {
                 // Route MIDI to all recording tracks
                 for (size_t trackIdx = 0; trackIdx < tracks_.size(); ++trackIdx) {
                     auto& track = tracks_[trackIdx];
-                    if (track.isRecording && track.synth) {
-                        track.synth->processMidiMessage(msg);
+                    if (track.isRecording) {
+                        // Route to sampler if track has one, otherwise to synth
+                        if (track.hasSampler && track.sampler) {
+                            if (msg.getType() == MidiMessageType::NoteOn && msg.getVelocity() > 0) {
+                                track.sampler->noteOn(msg.getNoteNumber(), msg.getVelocity());
+                            } else if (msg.getType() == MidiMessageType::NoteOff || 
+                                      (msg.getType() == MidiMessageType::NoteOn && msg.getVelocity() == 0)) {
+                                track.sampler->noteOff(msg.getNoteNumber());
+                            }
+                        } else if (track.synth) {
+                            track.synth->processMidiMessage(msg);
+                        }
                         
                         // If master record is active and playing, record to timeline
                         if (masterRecord_ && isPlaying_) {
@@ -810,10 +867,73 @@ void MainWindow::run() {
 #endif
 }
 
+void MainWindow::processDroppedFiles() {
+#ifdef PAN_USE_GUI
+    std::vector<std::string> filesToProcess;
+    {
+        std::lock_guard<std::mutex> lock(droppedFilesMutex_);
+        filesToProcess = std::move(droppedFiles_);
+        droppedFiles_.clear();
+    }
+    
+    if (!filesToProcess.empty()) {
+        std::cout << "[ProcessDrop] Processing " << filesToProcess.size() << " files" << std::endl;
+    }
+    
+    for (const auto& filePath : filesToProcess) {
+        std::cout << "[ProcessDrop] Processing: " << filePath << std::endl;
+        // Check if it's a supported audio file
+        std::string ext = std::filesystem::path(filePath).extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        
+        if (ext == ".wav" || ext == ".mp3") {
+            // Import the sample
+            if (importSample(filePath)) {
+                // If we have a selected track with sampler, load into it
+                if (!tracks_.empty() && selectedTrackIndex_ < tracks_.size()) {
+                    auto& track = tracks_[selectedTrackIndex_];
+                    
+                    // Find the imported sample
+                    std::string filename = std::filesystem::path(filePath).filename().string();
+                    for (size_t i = 0; i < userSamples_.size(); i++) {
+                        if (std::filesystem::path(userSamples_[i].path).filename().string() == filename) {
+                            // If track has sampler, load sample into it
+                            if (track.hasSampler) {
+                                track.samplerSamplePath = userSamples_[i].path;
+                                track.samplerWaveform = userSamples_[i].waveformDisplay;
+                                track.instrumentName = "Sampler: " + userSamples_[i].name;
+                            } else {
+                                // Create a sampler track with this sample
+                                track.hasSampler = true;
+                                track.samplerSamplePath = userSamples_[i].path;
+                                track.samplerWaveform = userSamples_[i].waveformDisplay;
+                                track.oscillators.clear();
+                                track.instrumentName = "Sampler: " + userSamples_[i].name;
+                            }
+                            // Create sampler instance and load sample
+                            if (!track.sampler) {
+                                double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                                track.sampler = std::make_shared<Sampler>(sampleRate);
+                            }
+                            track.sampler->loadSample(userSamples_[i].path);
+                            markDirty();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
+}
+
 void MainWindow::renderUI() {
 #ifdef PAN_USE_GUI
     // Update timeline if playing
     updateTimeline();
+    
+    // Process any files dropped from OS
+    processDroppedFiles();
     
     ImGuiViewport* viewport = ImGui::GetMainViewport();
     
@@ -1085,7 +1205,7 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
         
         if (userSamples_.empty()) {
             ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.4f, 1.0f), "  No samples loaded");
-            ImGui::TextColored(ImVec4(0.35f, 0.35f, 0.35f, 1.0f), "  (Drag WAV files here)");
+            ImGui::TextColored(ImVec4(0.35f, 0.35f, 0.35f, 1.0f), "  Drop WAV/MP3 onto window");
         } else {
             for (size_t i = 0; i < userSamples_.size(); ++i) {
                 const auto& sample = userSamples_[i];
@@ -1114,15 +1234,16 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
                     drawList->AddText(ImVec2(pos.x + 4, pos.y + 4), 
                                      IM_COL32(255, 255, 255, 200), sample.name.c_str());
                     
-                    ImGui::Dummy(ImVec2(width, height));
+                    // Use InvisibleButton for proper item ID (needed for context menu)
+                    ImGui::InvisibleButton("##sampleWave", ImVec2(width, height));
                 } else {
                     if (ImGui::Button(sample.name.c_str(), ImVec2(-1, 22))) {
                         // Click action
                     }
                 }
                 
-                // Right-click context menu for deletion
-                if (ImGui::BeginPopupContextItem()) {
+                // Right-click context menu for deletion (use explicit ID for safety)
+                if (ImGui::BeginPopupContextItem("##sampleCtx")) {
                     if (ImGui::MenuItem("Delete Sample")) {
                         std::filesystem::remove(sample.path);
                         userSamples_.erase(userSamples_.begin() + i);
@@ -1275,7 +1396,7 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
                 ImGui::PopStyleColor(2);
                 
                 // Right-click context menu for deletion
-                if (ImGui::BeginPopupContextItem()) {
+                if (ImGui::BeginPopupContextItem("##presetCtx")) {
                     if (ImGui::MenuItem("Delete")) {
                         userPresets_.erase(userPresets_.begin() + i);
                         saveUserPresetsToFile();
@@ -1441,190 +1562,24 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                 ImGui::Separator();
                 ImGui::Spacing();
                 
-                // Render Instrument Panel (which now contains oscillators in a sub-tab)
+                // Render unified instrument/sampler panel
                 auto& oscillators = tracks_[selectedTrackIndex_].oscillators;
-                if (!oscillators.empty() || tracks_[selectedTrackIndex_].hasSampler) {
-                    renderInstrumentPanel(selectedTrackIndex_);
+                bool hasSampler = tracks_[selectedTrackIndex_].hasSampler;
+                bool hasInstrument = !oscillators.empty() || hasSampler;
+                
+                if (hasInstrument) {
+                    if (hasSampler) {
+                        // Render unified Sampler panel with tabs for Sample and synth controls
+                        renderSamplerPanel(selectedTrackIndex_);
+                    } else {
+                        // Render synth instrument panel
+                        renderInstrumentPanel(selectedTrackIndex_);
+                    }
                 } else {
                     // Empty state - show drag hint
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
                     ImGui::Text("Drag an instrument from the browser to load");
                     ImGui::PopStyleColor();
-                }
-                
-                // Render Simpler if track has sampler
-                if (tracks_[selectedTrackIndex_].hasSampler) {
-                    ImGui::NewLine();
-                    
-                    // Ableton-style Sampler panel
-                    ImDrawList* drawList = ImGui::GetWindowDrawList();
-                    ImVec2 startPos = ImGui::GetCursorScreenPos();
-                    float panelWidth = ImGui::GetContentRegionAvail().x;
-                    float panelHeight = 180.0f;
-                    
-                    // Gray panel background (like Ableton)
-                    ImU32 panelBg = IM_COL32(58, 58, 60, 255);
-                    ImU32 headerBg = IM_COL32(42, 42, 44, 255);
-                    ImU32 waveformBg = IM_COL32(25, 28, 32, 255);
-                    ImU32 textDim = IM_COL32(120, 120, 120, 255);
-                    ImU32 accentColor = IM_COL32(220, 150, 50, 255);
-                    
-                    drawList->AddRectFilled(startPos, ImVec2(startPos.x + panelWidth, startPos.y + panelHeight), panelBg);
-                    
-                    // Header bar
-                    float headerHeight = 22.0f;
-                    drawList->AddRectFilled(startPos, ImVec2(startPos.x + panelWidth, startPos.y + headerHeight), headerBg);
-                    
-                    // Orange power indicator
-                    drawList->AddCircleFilled(ImVec2(startPos.x + 12, startPos.y + headerHeight/2), 5, accentColor);
-                    
-                    // Sample name or "Sampler"
-                    std::string samplerTitle = "Sampler";
-                    if (!tracks_[selectedTrackIndex_].samplerSamplePath.empty()) {
-                        samplerTitle = std::filesystem::path(tracks_[selectedTrackIndex_].samplerSamplePath).stem().string();
-                    }
-                    drawList->AddText(ImVec2(startPos.x + 24, startPos.y + 4), IM_COL32(200, 200, 200, 255), samplerTitle.c_str());
-                    
-                    // Tab buttons in header
-                    float tabX = startPos.x + 200;
-                    const char* tabs[] = {"Zone", "Sample", "Pitch/Osc", "Filter/Global", "Modulation"};
-                    static int activeSamplerTab = 1;
-                    
-                    for (int i = 0; i < 5; i++) {
-                        ImVec2 textSize = ImGui::CalcTextSize(tabs[i]);
-                        bool isActive = (activeSamplerTab == i);
-                        
-                        // Colored dot
-                        ImU32 dotColor = isActive ? accentColor : IM_COL32(80, 80, 80, 255);
-                        drawList->AddCircleFilled(ImVec2(tabX, startPos.y + headerHeight/2), 3, dotColor);
-                        tabX += 8;
-                        
-                        // Tab text
-                        drawList->AddText(ImVec2(tabX, startPos.y + 4), 
-                                         isActive ? IM_COL32(200, 200, 200, 255) : textDim, tabs[i]);
-                        
-                        // Click detection
-                        ImGui::SetCursorScreenPos(ImVec2(tabX - 8, startPos.y));
-                        ImGui::InvisibleButton(tabs[i], ImVec2(textSize.x + 16, headerHeight));
-                        if (ImGui::IsItemClicked()) activeSamplerTab = i;
-                        
-                        tabX += textSize.x + 16;
-                    }
-                    
-                    // Close button
-                    ImVec2 closePos = ImVec2(startPos.x + panelWidth - 20, startPos.y + 4);
-                    drawList->AddText(closePos, textDim, "x");
-                    ImGui::SetCursorScreenPos(closePos);
-                    ImGui::InvisibleButton("##closeSampler", ImVec2(16, 16));
-                    if (ImGui::IsItemClicked()) {
-                        tracks_[selectedTrackIndex_].hasSampler = false;
-                        markDirty();
-                    }
-                    
-                    // Waveform display area
-                    ImVec2 waveformPos = ImVec2(startPos.x + 4, startPos.y + headerHeight + 4);
-                    float waveformWidth = panelWidth - 8;
-                    float waveformHeight = 80.0f;
-                    
-                    drawList->AddRectFilled(waveformPos, 
-                                           ImVec2(waveformPos.x + waveformWidth, waveformPos.y + waveformHeight),
-                                           waveformBg);
-                    drawList->AddRect(waveformPos, 
-                                     ImVec2(waveformPos.x + waveformWidth, waveformPos.y + waveformHeight),
-                                     IM_COL32(50, 80, 120, 255));
-                    
-                    // Draw ORANGE waveform if sample loaded (like Ableton)
-                    if (!tracks_[selectedTrackIndex_].samplerWaveform.empty()) {
-                        float centerY = waveformPos.y + waveformHeight / 2.0f;
-                        float xStep = waveformWidth / tracks_[selectedTrackIndex_].samplerWaveform.size();
-                        ImU32 waveColor = IM_COL32(230, 160, 60, 255); // Orange like Ableton
-                        
-                        for (size_t j = 0; j < tracks_[selectedTrackIndex_].samplerWaveform.size(); ++j) {
-                            float x = waveformPos.x + j * xStep;
-                            float amp = tracks_[selectedTrackIndex_].samplerWaveform[j] * (waveformHeight / 2.0f - 4.0f);
-                            drawList->AddLine(ImVec2(x, centerY - amp), ImVec2(x, centerY + amp), waveColor);
-                        }
-                        
-                        // Time markers below waveform
-                        drawList->AddText(ImVec2(waveformPos.x + 4, waveformPos.y + waveformHeight - 14), textDim, "0:00");
-                        drawList->AddText(ImVec2(waveformPos.x + waveformWidth/2 - 15, waveformPos.y + waveformHeight - 14), textDim, "0:00:500");
-                        drawList->AddText(ImVec2(waveformPos.x + waveformWidth - 35, waveformPos.y + waveformHeight - 14), textDim, "0:01");
-                    } else {
-                        const char* dropText = "Drop sample here";
-                        ImVec2 textSize = ImGui::CalcTextSize(dropText);
-                        drawList->AddText(ImVec2(waveformPos.x + (waveformWidth - textSize.x) / 2.0f,
-                                                waveformPos.y + (waveformHeight - textSize.y) / 2.0f),
-                                         IM_COL32(80, 80, 80, 255), dropText);
-                    }
-                    
-                    // Drop target for waveform area
-                    ImGui::SetCursorScreenPos(waveformPos);
-                    ImGui::InvisibleButton("##waveformDrop", ImVec2(waveformWidth, waveformHeight));
-                    if (ImGui::BeginDragDropTarget()) {
-                        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("SAMPLE")) {
-                            if (payload->DataSize == sizeof(size_t)) {
-                                size_t sampleIdx = *(size_t*)payload->Data;
-                                if (sampleIdx < userSamples_.size()) {
-                                    tracks_[selectedTrackIndex_].samplerSamplePath = userSamples_[sampleIdx].path;
-                                    tracks_[selectedTrackIndex_].samplerWaveform = userSamples_[sampleIdx].waveformDisplay;
-                                    tracks_[selectedTrackIndex_].instrumentName = "Sampler: " + userSamples_[sampleIdx].name;
-                                    markDirty();
-                                }
-                            }
-                        }
-                        ImGui::EndDragDropTarget();
-                    }
-                    
-                    // Control rows below waveform (like Ableton Sampler)
-                    ImVec2 controlsPos = ImVec2(startPos.x + 4, startPos.y + headerHeight + waveformHeight + 10);
-                    
-                    // Row 1 labels
-                    drawList->AddText(ImVec2(controlsPos.x, controlsPos.y), textDim, "Reverse");
-                    drawList->AddText(ImVec2(controlsPos.x + 60, controlsPos.y), textDim, "Sample");
-                    drawList->AddText(ImVec2(controlsPos.x + 200, controlsPos.y), textDim, "Vol");
-                    drawList->AddText(ImVec2(controlsPos.x + 260, controlsPos.y), textDim, "Sample Start");
-                    drawList->AddText(ImVec2(controlsPos.x + 360, controlsPos.y), textDim, "Sustain Mode");
-                    drawList->AddText(ImVec2(controlsPos.x + 460, controlsPos.y), textDim, "Loop Start");
-                    drawList->AddText(ImVec2(controlsPos.x + 540, controlsPos.y), textDim, "Loop End");
-                    
-                    // Row 1 values
-                    controlsPos.y += 14;
-                    drawList->AddText(ImVec2(controlsPos.x, controlsPos.y), IM_COL32(200, 200, 200, 255), "Off");
-                    if (!tracks_[selectedTrackIndex_].samplerSamplePath.empty()) {
-                        std::string sampleName = std::filesystem::path(tracks_[selectedTrackIndex_].samplerSamplePath).stem().string();
-                        if (sampleName.length() > 15) sampleName = sampleName.substr(0, 15) + "...";
-                        drawList->AddText(ImVec2(controlsPos.x + 60, controlsPos.y), accentColor, sampleName.c_str());
-                    }
-                    drawList->AddText(ImVec2(controlsPos.x + 200, controlsPos.y), accentColor, "0.0 dB");
-                    drawList->AddText(ImVec2(controlsPos.x + 260, controlsPos.y), accentColor, "0");
-                    drawList->AddText(ImVec2(controlsPos.x + 460, controlsPos.y), accentColor, "0");
-                    drawList->AddText(ImVec2(controlsPos.x + 540, controlsPos.y), accentColor, "50237");
-                    
-                    // Row 2 labels
-                    controlsPos.y += 20;
-                    drawList->AddText(ImVec2(controlsPos.x, controlsPos.y), textDim, "Snap");
-                    drawList->AddText(ImVec2(controlsPos.x + 60, controlsPos.y), textDim, "Root");
-                    drawList->AddText(ImVec2(controlsPos.x + 110, controlsPos.y), textDim, "Detune");
-                    drawList->AddText(ImVec2(controlsPos.x + 170, controlsPos.y), textDim, "Scale");
-                    drawList->AddText(ImVec2(controlsPos.x + 220, controlsPos.y), textDim, "Pan");
-                    drawList->AddText(ImVec2(controlsPos.x + 260, controlsPos.y), textDim, "Sample End");
-                    drawList->AddText(ImVec2(controlsPos.x + 360, controlsPos.y), textDim, "Release Mode");
-                    
-                    // Row 2 values
-                    controlsPos.y += 14;
-                    drawList->AddText(ImVec2(controlsPos.x, controlsPos.y), IM_COL32(200, 200, 200, 255), "Off");
-                    drawList->AddText(ImVec2(controlsPos.x + 60, controlsPos.y), IM_COL32(80, 180, 220, 255), "C0");
-                    drawList->AddText(ImVec2(controlsPos.x + 110, controlsPos.y), accentColor, "0 ct");
-                    drawList->AddText(ImVec2(controlsPos.x + 170, controlsPos.y), accentColor, "100 %");
-                    drawList->AddText(ImVec2(controlsPos.x + 220, controlsPos.y), accentColor, "C");
-                    drawList->AddText(ImVec2(controlsPos.x + 260, controlsPos.y), accentColor, "50237");
-                    drawList->AddText(ImVec2(controlsPos.x + 360, controlsPos.y), IM_COL32(200, 200, 200, 255), "Off");
-                    
-                    // RAM indicator
-                    drawList->AddText(ImVec2(startPos.x + panelWidth - 40, controlsPos.y), IM_COL32(80, 180, 220, 255), "RAM");
-                    
-                    ImGui::SetCursorScreenPos(ImVec2(startPos.x, startPos.y + panelHeight));
-                    ImGui::Dummy(ImVec2(panelWidth, 1));
                 }
             } else {
                 ImGui::Text("No tracks available");
@@ -2045,8 +2000,8 @@ void MainWindow::renderInstrumentPanel(size_t trackIndex) {
     
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     ImVec2 startPos = ImGui::GetCursorScreenPos();
-    float panelWidth = ImGui::GetContentRegionAvail().x;
-    float panelHeight = std::min(ImGui::GetContentRegionAvail().y, 160.0f); // Compact height
+    float panelWidth = ImGui::GetContentRegionAvail().x / 3.0f; // 1/3rd of components panel width
+    float panelHeight = 140.0f; // Fixed compact height like Ableton
     
     // Colors
     ImU32 panelBg = IM_COL32(52, 52, 54, 255);
@@ -2238,6 +2193,323 @@ void MainWindow::renderInstrumentPanel(size_t trackIndex) {
 #endif
 }
 
+void MainWindow::renderSamplerPanel(size_t trackIndex) {
+#ifdef PAN_USE_GUI
+    if (trackIndex >= tracks_.size() || !tracks_[trackIndex].synth) return;
+    
+    auto& synth = tracks_[trackIndex].synth;
+    auto& env = synth->getEnvelope();
+    
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    ImVec2 startPos = ImGui::GetCursorScreenPos();
+    // Make sampler panel 1/3 width of components panel
+    float panelWidth = ImGui::GetContentRegionAvail().x / 3.0f;
+    float panelHeight = 160.0f;
+    
+    // Colors
+    ImU32 panelBg = IM_COL32(52, 52, 54, 255);
+    ImU32 sectionBg = IM_COL32(42, 42, 44, 255);
+    ImU32 headerBg = IM_COL32(38, 38, 40, 255);
+    ImU32 waveformBg = IM_COL32(25, 28, 32, 255);
+    ImU32 textDim = IM_COL32(110, 110, 110, 255);
+    ImU32 textBright = IM_COL32(190, 190, 190, 255);
+    ImU32 accentColor = IM_COL32(220, 130, 50, 255);
+    
+    drawList->AddRectFilled(startPos, ImVec2(startPos.x + panelWidth, startPos.y + panelHeight), panelBg);
+    
+    // Header bar
+    float headerHeight = 20.0f;
+    drawList->AddRectFilled(startPos, ImVec2(startPos.x + panelWidth, startPos.y + headerHeight), headerBg);
+    
+    // Power indicator + sample name (truncated to fit panel width)
+    drawList->AddCircleFilled(ImVec2(startPos.x + 10, startPos.y + headerHeight/2), 4, accentColor);
+    std::string title = "Sampler";
+    if (!tracks_[trackIndex].samplerSamplePath.empty()) {
+        title = std::filesystem::path(tracks_[trackIndex].samplerSamplePath).stem().string();
+    }
+    // Truncate title if too long for panel
+    float maxTitleWidth = panelWidth - 160;  // Leave room for tabs
+    ImVec2 titleSize = ImGui::CalcTextSize(title.c_str());
+    if (titleSize.x > maxTitleWidth && title.length() > 3) {
+        while (titleSize.x > maxTitleWidth && title.length() > 10) {
+            title = title.substr(0, title.length() - 4) + "...";
+            titleSize = ImGui::CalcTextSize(title.c_str());
+        }
+    }
+    drawList->AddText(ImVec2(startPos.x + 20, startPos.y + 3), textBright, title.c_str());
+    
+    // Tabs in header: Sample, Filter, LFO, Pitch
+    static int activeSamplerTab = 0;
+    float tabX = startPos.x + 150;
+    const char* tabs[] = {"Sample", "Filter", "LFO", "Pitch"};
+    
+    for (int i = 0; i < 4; i++) {
+        ImVec2 textSize = ImGui::CalcTextSize(tabs[i]);
+        bool isActive = (activeSamplerTab == i);
+        
+        drawList->AddCircleFilled(ImVec2(tabX, startPos.y + headerHeight/2), 3, 
+                                  isActive ? accentColor : IM_COL32(70, 70, 70, 255));
+        tabX += 8;
+        drawList->AddText(ImVec2(tabX, startPos.y + 3), isActive ? textBright : textDim, tabs[i]);
+        
+        ImGui::SetCursorScreenPos(ImVec2(tabX - 8, startPos.y));
+        ImGui::InvisibleButton(tabs[i], ImVec2(textSize.x + 16, headerHeight));
+        if (ImGui::IsItemClicked()) activeSamplerTab = i;
+        
+        tabX += textSize.x + 16;
+    }
+    
+    // Close button
+    ImVec2 closePos = ImVec2(startPos.x + panelWidth - 18, startPos.y + 4);
+    drawList->AddText(closePos, textDim, "x");
+    ImGui::SetCursorScreenPos(closePos);
+    ImGui::InvisibleButton("##closeSampler", ImVec2(14, 14));
+    if (ImGui::IsItemClicked()) {
+        tracks_[trackIndex].hasSampler = false;
+        markDirty();
+    }
+    
+    ImVec2 contentPos = ImVec2(startPos.x + 4, startPos.y + headerHeight + 2);
+    float contentHeight = panelHeight - headerHeight - 6;
+    
+    // === SAMPLE TAB ===
+    if (activeSamplerTab == 0) {
+        // Waveform display
+        float waveformHeight = contentHeight - 30;
+        drawList->AddRectFilled(contentPos, 
+                               ImVec2(contentPos.x + panelWidth - 8, contentPos.y + waveformHeight),
+                               waveformBg);
+        drawList->AddRect(contentPos, 
+                         ImVec2(contentPos.x + panelWidth - 8, contentPos.y + waveformHeight),
+                         IM_COL32(50, 80, 120, 255));
+        
+        // Draw waveform
+        if (!tracks_[trackIndex].samplerWaveform.empty()) {
+            float centerY = contentPos.y + waveformHeight / 2.0f;
+            float waveWidth = panelWidth - 12;
+            float xStep = waveWidth / tracks_[trackIndex].samplerWaveform.size();
+            ImU32 waveColor = IM_COL32(230, 160, 60, 255);
+            
+            for (size_t j = 0; j < tracks_[trackIndex].samplerWaveform.size(); ++j) {
+                float x = contentPos.x + 2 + j * xStep;
+                float amp = tracks_[trackIndex].samplerWaveform[j] * (waveformHeight / 2.0f - 4.0f);
+                drawList->AddLine(ImVec2(x, centerY - amp), ImVec2(x, centerY + amp), waveColor);
+            }
+        } else {
+            const char* dropText = "Drop .WAV file or sample from Browser";
+            ImVec2 textSize = ImGui::CalcTextSize(dropText);
+            drawList->AddText(ImVec2(contentPos.x + (panelWidth - 8 - textSize.x) / 2.0f,
+                                    contentPos.y + (waveformHeight - textSize.y) / 2.0f),
+                             IM_COL32(80, 80, 80, 255), dropText);
+        }
+        
+        // Drop target
+        ImGui::SetCursorScreenPos(contentPos);
+        ImGui::InvisibleButton("##waveformDrop", ImVec2(panelWidth - 8, waveformHeight));
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("SAMPLE")) {
+                if (payload->DataSize == sizeof(size_t)) {
+                    size_t sampleIdx = *(size_t*)payload->Data;
+                    if (sampleIdx < userSamples_.size()) {
+                        tracks_[trackIndex].samplerSamplePath = userSamples_[sampleIdx].path;
+                        tracks_[trackIndex].samplerWaveform = userSamples_[sampleIdx].waveformDisplay;
+                        tracks_[trackIndex].instrumentName = "Sampler: " + userSamples_[sampleIdx].name;
+                        // Create sampler if needed and load sample
+                        if (!tracks_[trackIndex].sampler) {
+                            double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                            tracks_[trackIndex].sampler = std::make_shared<Sampler>(sampleRate);
+                        }
+                        tracks_[trackIndex].sampler->loadSample(userSamples_[sampleIdx].path);
+                        markDirty();
+                    }
+                }
+            }
+            ImGui::EndDragDropTarget();
+        }
+        
+        // Sample controls row - click-drag to modify
+        ImVec2 ctrlPos = ImVec2(contentPos.x, contentPos.y + waveformHeight + 2);
+        float ctrlSpacing = (panelWidth - 16) / 4.0f;
+        
+        // Track sampler parameters (store in track)
+        static float samplerVol = 0.0f;  // dB
+        static int samplerRoot = 60;      // MIDI note (C4)
+        static float samplerDetune = 0.0f; // cents
+        static float samplerPan = 0.0f;   // -1 to 1
+        
+        // Volume control (drag up/down)
+        ImVec2 volPos = ctrlPos;
+        drawList->AddText(volPos, textDim, "Vol");
+        volPos.y += 10;
+        char volText[16];
+        snprintf(volText, sizeof(volText), "%.1f dB", samplerVol);
+        drawList->AddText(volPos, accentColor, volText);
+        
+        ImGui::SetCursorScreenPos(ImVec2(ctrlPos.x, ctrlPos.y));
+        ImGui::InvisibleButton("##samplerVol", ImVec2(ctrlSpacing - 4, 22));
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0)) {
+            samplerVol += ImGui::GetIO().MouseDelta.y * -0.1f;
+            samplerVol = std::clamp(samplerVol, -60.0f, 12.0f);
+            if (synth) {
+                float linear = std::pow(10.0f, samplerVol / 20.0f);
+                synth->setVolume(linear);
+            }
+            markDirty();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        }
+        
+        // Root note control (drag up/down)
+        ImVec2 rootPos = ImVec2(ctrlPos.x + ctrlSpacing, ctrlPos.y);
+        drawList->AddText(rootPos, textDim, "Root");
+        rootPos.y += 10;
+        const char* noteNames[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+        char rootText[8];
+        snprintf(rootText, sizeof(rootText), "%s%d", noteNames[samplerRoot % 12], (samplerRoot / 12) - 1);
+        drawList->AddText(rootPos, IM_COL32(80, 180, 220, 255), rootText);
+        
+        ImGui::SetCursorScreenPos(ImVec2(ctrlPos.x + ctrlSpacing, ctrlPos.y));
+        ImGui::InvisibleButton("##samplerRoot", ImVec2(ctrlSpacing - 4, 22));
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0)) {
+            static float rootAccum = 0.0f;
+            rootAccum += ImGui::GetIO().MouseDelta.y * -0.05f;
+            if (std::abs(rootAccum) >= 1.0f) {
+                samplerRoot += static_cast<int>(rootAccum);
+                samplerRoot = std::clamp(samplerRoot, 0, 127);
+                rootAccum = 0.0f;
+                markDirty();
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        }
+        
+        // Detune control (drag up/down)
+        ImVec2 detunePos = ImVec2(ctrlPos.x + ctrlSpacing * 2, ctrlPos.y);
+        drawList->AddText(detunePos, textDim, "Detune");
+        detunePos.y += 10;
+        char detuneText[16];
+        snprintf(detuneText, sizeof(detuneText), "%.0f ct", samplerDetune);
+        drawList->AddText(detunePos, accentColor, detuneText);
+        
+        ImGui::SetCursorScreenPos(ImVec2(ctrlPos.x + ctrlSpacing * 2, ctrlPos.y));
+        ImGui::InvisibleButton("##samplerDetune", ImVec2(ctrlSpacing - 4, 22));
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0)) {
+            samplerDetune += ImGui::GetIO().MouseDelta.y * -0.5f;
+            samplerDetune = std::clamp(samplerDetune, -100.0f, 100.0f);
+            markDirty();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        }
+        
+        // Pan control (drag LEFT/RIGHT)
+        ImVec2 panPos = ImVec2(ctrlPos.x + ctrlSpacing * 3, ctrlPos.y);
+        drawList->AddText(panPos, textDim, "Pan");
+        panPos.y += 10;
+        char panText[8];
+        if (std::abs(samplerPan) < 0.01f) {
+            snprintf(panText, sizeof(panText), "C");
+        } else if (samplerPan < 0) {
+            snprintf(panText, sizeof(panText), "%.0fL", -samplerPan * 50);
+        } else {
+            snprintf(panText, sizeof(panText), "%.0fR", samplerPan * 50);
+        }
+        drawList->AddText(panPos, accentColor, panText);
+        
+        ImGui::SetCursorScreenPos(ImVec2(ctrlPos.x + ctrlSpacing * 3, ctrlPos.y));
+        ImGui::InvisibleButton("##samplerPan", ImVec2(ctrlSpacing - 4, 22));
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0)) {
+            samplerPan += ImGui::GetIO().MouseDelta.x * 0.01f;  // LEFT/RIGHT drag
+            samplerPan = std::clamp(samplerPan, -1.0f, 1.0f);
+            markDirty();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);  // Left-right cursor
+        }
+    }
+    // === FILTER TAB ===
+    else if (activeSamplerTab == 1) {
+        ImGui::SetCursorScreenPos(ImVec2(contentPos.x, contentPos.y + 4));
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.17f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.55f, 0.2f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.9f, 0.5f, 0.2f, 1.0f));
+        
+        bool filtOn = env.filter.enabled;
+        if (ImGui::Checkbox("Enable Filter", &filtOn)) env.filter.enabled = filtOn;
+        
+        ImGui::PushItemWidth(100);
+        float freq = env.filter.cutoff * 20000;
+        if (ImGui::SliderFloat("Frequency", &freq, 20.0f, 20000.0f, "%.0f Hz")) {
+            env.filter.cutoff = freq / 20000.0f;
+        }
+        float res = env.filter.resonance;
+        if (ImGui::SliderFloat("Resonance", &res, 0.0f, 1.0f, "%.2f")) {
+            env.filter.resonance = res;
+        }
+        float envAmt = env.filter.envAmount;
+        if (ImGui::SliderFloat("Env Amount", &envAmt, -1.0f, 1.0f, "%.2f")) {
+            env.filter.envAmount = envAmt;
+        }
+        ImGui::PopItemWidth();
+        ImGui::PopStyleColor(3);
+    }
+    // === LFO TAB ===
+    else if (activeSamplerTab == 2) {
+        ImGui::SetCursorScreenPos(ImVec2(contentPos.x, contentPos.y + 4));
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.17f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.55f, 0.2f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.9f, 0.5f, 0.2f, 1.0f));
+        
+        bool lfoOn = env.lfo1.enabled;
+        if (ImGui::Checkbox("Enable LFO", &lfoOn)) env.lfo1.enabled = lfoOn;
+        
+        ImGui::PushItemWidth(100);
+        float rate = env.lfo1.rate;
+        if (ImGui::SliderFloat("Rate", &rate, 0.01f, 30.0f, "%.2f Hz")) {
+            env.lfo1.rate = rate;
+        }
+        float depth = env.lfo1.depth;
+        if (ImGui::SliderFloat("Depth", &depth, 0.0f, 1.0f, "%.2f")) {
+            env.lfo1.depth = depth;
+        }
+        const char* targets[] = {"Pitch", "Volume", "Filter"};
+        int target = static_cast<int>(env.lfo1.target);
+        if (ImGui::Combo("Target", &target, targets, 3)) {
+            env.lfo1.target = static_cast<LFO::Target>(target);
+        }
+        ImGui::PopItemWidth();
+        ImGui::PopStyleColor(3);
+    }
+    // === PITCH TAB ===
+    else if (activeSamplerTab == 3) {
+        ImGui::SetCursorScreenPos(ImVec2(contentPos.x, contentPos.y + 4));
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.15f, 0.15f, 0.17f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.55f, 0.2f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(0.9f, 0.5f, 0.2f, 1.0f));
+        
+        bool pitchOn = env.pitchEnvelope.enabled;
+        if (ImGui::Checkbox("Enable Pitch Env", &pitchOn)) env.pitchEnvelope.enabled = pitchOn;
+        
+        ImGui::PushItemWidth(100);
+        float pstart = env.pitchEnvelope.startMultiplier;
+        if (ImGui::SliderFloat("Start", &pstart, 0.5f, 4.0f, "%.2fx")) {
+            env.pitchEnvelope.startMultiplier = pstart;
+        }
+        float pdecay = env.pitchEnvelope.decayTime * 1000;
+        if (ImGui::SliderFloat("Decay", &pdecay, 1.0f, 500.0f, "%.0f ms")) {
+            env.pitchEnvelope.decayTime = pdecay / 1000.0f;
+        }
+        ImGui::PopItemWidth();
+        ImGui::PopStyleColor(3);
+    }
+    
+    ImGui::SetCursorScreenPos(ImVec2(startPos.x, startPos.y + panelHeight + 4));
+    ImGui::Dummy(ImVec2(panelWidth, 1));
+#endif
+}
+
 void MainWindow::renderEffectBox(size_t trackIndex, size_t effectIndex, std::shared_ptr<Effect> effect) {
 #ifdef PAN_USE_GUI
     if (!effect) return;
@@ -2247,6 +2519,7 @@ void MainWindow::renderEffectBox(size_t trackIndex, size_t effectIndex, std::sha
     auto reverb = std::dynamic_pointer_cast<Reverb>(effect);
     auto chorus = std::dynamic_pointer_cast<Chorus>(effect);
     auto distortion = std::dynamic_pointer_cast<Distortion>(effect);
+    auto eq8 = std::dynamic_pointer_cast<EQ8>(effect);
     
     // Ableton-style effect device box
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.12f, 1.0f));
@@ -2254,7 +2527,10 @@ void MainWindow::renderEffectBox(size_t trackIndex, size_t effectIndex, std::sha
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
     
-    ImGui::BeginChild(ImGui::GetID("effect_box"), ImVec2(200, 220), true, ImGuiWindowFlags_None);
+    // EQ8 needs more space for the frequency display
+    float boxHeight = eq8 ? 320.0f : 220.0f;
+    float boxWidth2 = eq8 ? 240.0f : 200.0f;
+    ImGui::BeginChild(ImGui::GetID("effect_box"), ImVec2(boxWidth2, boxHeight), true, ImGuiWindowFlags_None);
     
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     ImVec2 boxPos = ImGui::GetWindowPos();
@@ -2493,6 +2769,183 @@ void MainWindow::renderEffectBox(size_t trackIndex, size_t effectIndex, std::sha
         
         if (anyChanged && distortion->getCurrentPreset() != Distortion::Preset::Custom) {
             distortion->setCurrentPreset(Distortion::Preset::Custom);
+        }
+    } else if (eq8) {
+        // EQ8 preset selector
+        ImGui::SetNextItemWidth(140);
+        const char* currentPresetName = EQ8::getPresetName(eq8->getCurrentPreset());
+        if (ImGui::BeginCombo("Preset##eq8", currentPresetName)) {
+            for (int i = 0; i < 7; ++i) {
+                EQ8::Preset preset = static_cast<EQ8::Preset>(i);
+                const char* presetName = EQ8::getPresetName(preset);
+                if (ImGui::Selectable(presetName, eq8->getCurrentPreset() == preset)) {
+                    eq8->loadPreset(preset);
+                    markDirty();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        
+        // Frequency response visualization
+        ImVec2 graphPos = ImGui::GetCursorScreenPos();
+        float graphWidth = boxWidth - 16;
+        float graphHeight = 60.0f;
+        
+        // Graph background
+        drawList->AddRectFilled(graphPos, 
+                               ImVec2(graphPos.x + graphWidth, graphPos.y + graphHeight),
+                               IM_COL32(20, 20, 22, 255), 4.0f);
+        drawList->AddRect(graphPos, 
+                         ImVec2(graphPos.x + graphWidth, graphPos.y + graphHeight),
+                         IM_COL32(50, 50, 55, 255), 4.0f);
+        
+        // Draw 0dB line
+        float centerY = graphPos.y + graphHeight / 2.0f;
+        drawList->AddLine(ImVec2(graphPos.x, centerY), 
+                         ImVec2(graphPos.x + graphWidth, centerY),
+                         IM_COL32(50, 50, 60, 255));
+        
+        // Draw frequency markers
+        const float freqMarkers[] = {100.0f, 1000.0f, 10000.0f};
+        for (float freq : freqMarkers) {
+            float logFreq = std::log10(freq / 20.0f) / std::log10(20000.0f / 20.0f);
+            float x = graphPos.x + logFreq * graphWidth;
+            drawList->AddLine(ImVec2(x, graphPos.y), ImVec2(x, graphPos.y + graphHeight),
+                             IM_COL32(40, 40, 45, 255));
+        }
+        
+        // Draw EQ curve
+        ImVec2 prevPoint;
+        for (int px = 0; px < static_cast<int>(graphWidth); px++) {
+            float logX = static_cast<float>(px) / graphWidth;
+            float freq = 20.0f * std::pow(20000.0f / 20.0f, logX);
+            
+            // Approximate combined gain at this frequency
+            float totalGain = 0.0f;
+            for (int b = 0; b < EQ8::NUM_BANDS; b++) {
+                const auto& band = eq8->getBand(b);
+                if (!band.enabled) continue;
+                
+                float bandGain = band.gain;
+                float bandFreq = band.frequency;
+                float q = band.q;
+                
+                // Simple bell curve approximation for visualization
+                float octaveDist = std::log2(freq / bandFreq);
+                float falloff = std::exp(-octaveDist * octaveDist * q);
+                totalGain += bandGain * falloff;
+            }
+            
+            // Map gain to Y (-24dB to +24dB)
+            totalGain = std::clamp(totalGain, -24.0f, 24.0f);
+            float y = centerY - (totalGain / 24.0f) * (graphHeight / 2.0f - 4.0f);
+            
+            ImVec2 point(graphPos.x + px, y);
+            if (px > 0) {
+                drawList->AddLine(prevPoint, point, IM_COL32(51, 153, 219, 255), 2.0f);
+            }
+            prevPoint = point;
+        }
+        
+        // Draw band markers
+        for (int b = 0; b < EQ8::NUM_BANDS; b++) {
+            const auto& band = eq8->getBand(b);
+            if (!band.enabled) continue;
+            
+            float logFreq = std::log10(band.frequency / 20.0f) / std::log10(20000.0f / 20.0f);
+            float x = graphPos.x + logFreq * graphWidth;
+            float gain = std::clamp(band.gain, -24.0f, 24.0f);
+            float y = centerY - (gain / 24.0f) * (graphHeight / 2.0f - 4.0f);
+            
+            // Band dot
+            drawList->AddCircleFilled(ImVec2(x, y), 5.0f, IM_COL32(230, 160, 60, 255));
+            drawList->AddCircle(ImVec2(x, y), 5.0f, IM_COL32(255, 200, 100, 255), 0, 1.5f);
+            
+            // Band number
+            char label[4];
+            snprintf(label, sizeof(label), "%d", b + 1);
+            drawList->AddText(ImVec2(x - 3, y - 14), IM_COL32(180, 180, 180, 255), label);
+        }
+        
+        ImGui::Dummy(ImVec2(graphWidth, graphHeight + 4));
+        
+        // Compact band controls - show 2 selected bands at a time
+        static int selectedBand = 0;
+        
+        // Band selector buttons
+        ImGui::SetNextItemWidth(graphWidth);
+        for (int b = 0; b < 8; b++) {
+            bool isActive = (selectedBand == b);
+            bool bandEnabled = eq8->getBand(b).enabled;
+            
+            ImGui::PushID(b);
+            if (isActive) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.55f, 0.75f, 1.0f));
+            } else if (!bandEnabled) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.15f, 0.15f, 1.0f));
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.2f, 0.22f, 1.0f));
+            }
+            
+            char btnLabel[4];
+            snprintf(btnLabel, sizeof(btnLabel), "%d", b + 1);
+            if (ImGui::Button(btnLabel, ImVec2(18, 18))) {
+                selectedBand = b;
+            }
+            ImGui::PopStyleColor();
+            ImGui::PopID();
+            
+            if (b < 7) ImGui::SameLine(0, 2);
+        }
+        
+        // Selected band controls
+        auto& band = eq8->getBand(selectedBand);
+        bool anyChanged = false;
+        
+        ImGui::Checkbox("##enable", &band.enabled);
+        if (ImGui::IsItemEdited()) {
+            eq8->updateCoefficients(selectedBand);
+            anyChanged = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.9f, 0.6f, 0.2f, 1.0f), "Band %d", selectedBand + 1);
+        
+        // Frequency
+        ImGui::SetNextItemWidth(100);
+        float freq = band.frequency;
+        if (ImGui::SliderFloat("##freq", &freq, 20.0f, 20000.0f, "%.0f Hz", ImGuiSliderFlags_Logarithmic)) {
+            band.frequency = freq;
+            eq8->updateCoefficients(selectedBand);
+            anyChanged = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Freq");
+        
+        // Gain
+        ImGui::SetNextItemWidth(100);
+        float gain = band.gain;
+        if (ImGui::SliderFloat("##gain", &gain, -24.0f, 24.0f, "%.1f dB")) {
+            band.gain = gain;
+            eq8->updateCoefficients(selectedBand);
+            anyChanged = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Gain");
+        
+        // Q
+        ImGui::SetNextItemWidth(100);
+        float q = band.q;
+        if (ImGui::SliderFloat("##q", &q, 0.1f, 18.0f, "%.1f Q")) {
+            band.q = q;
+            eq8->updateCoefficients(selectedBand);
+            anyChanged = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Q");
+        
+        if (anyChanged) {
+            eq8->setCurrentPreset(EQ8::Preset::Custom);
+            markDirty();
         }
     }
     
@@ -3045,6 +3498,9 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
                 tracks_[i].samplerWaveform.clear();
                 tracks_[i].oscillators.clear();  // Clear oscillators when loading sampler
                 tracks_[i].instrumentName = "Sampler";
+                // Create sampler instance
+                double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                tracks_[i].sampler = std::make_shared<Sampler>(sampleRate);
                 selectedTrackIndex_ = i;
                 markDirty();
             }
@@ -3058,6 +3514,10 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
                         tracks_[i].samplerWaveform = userSamples_[sampleIdx].waveformDisplay;
                         tracks_[i].oscillators.clear();  // Clear oscillators when loading sample
                         tracks_[i].instrumentName = "Sampler: " + userSamples_[sampleIdx].name;
+                        // Create sampler and load sample
+                        double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                        tracks_[i].sampler = std::make_shared<Sampler>(sampleRate);
+                        tracks_[i].sampler->loadSample(userSamples_[sampleIdx].path);
                         selectedTrackIndex_ = i;
                         markDirty();
                     }
@@ -3147,6 +3607,87 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
         tracks_.push_back(std::move(newTrack));
         selectedTrackIndex_ = tracks_.size() - 1;
         markDirty();
+    }
+    
+    // Drop target for + Add Track button (accept instruments, sampler, samples)
+    ImGui::SetCursorScreenPos(addBtnPos);
+    ImGui::InvisibleButton("##addTrackDrop", addBtnSize);
+    if (ImGui::BeginDragDropTarget()) {
+        // Accept Sampler
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("SIMPLER")) {
+            Track newTrack;
+            newTrack.colorIndex = static_cast<int>(tracks_.size() % 24);
+            newTrack.synth = std::make_shared<Synthesizer>(engine_->getSampleRate());
+            newTrack.synth->setVolume(0.5f);
+            newTrack.hasSampler = true;
+            newTrack.oscillators.clear();
+            newTrack.instrumentName = "Sampler";
+            // Create sampler instance
+            newTrack.sampler = std::make_shared<Sampler>(engine_->getSampleRate());
+            tracks_.push_back(std::move(newTrack));
+            selectedTrackIndex_ = tracks_.size() - 1;
+            markDirty();
+        }
+        // Accept Sample - create sampler with sample loaded
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("SAMPLE")) {
+            if (payload->DataSize == sizeof(size_t)) {
+                size_t sampleIdx = *(size_t*)payload->Data;
+                if (sampleIdx < userSamples_.size()) {
+                    Track newTrack;
+                    newTrack.colorIndex = static_cast<int>(tracks_.size() % 24);
+                    newTrack.synth = std::make_shared<Synthesizer>(engine_->getSampleRate());
+                    newTrack.synth->setVolume(0.5f);
+                    newTrack.hasSampler = true;
+                    newTrack.samplerSamplePath = userSamples_[sampleIdx].path;
+                    newTrack.samplerWaveform = userSamples_[sampleIdx].waveformDisplay;
+                    newTrack.oscillators.clear();
+                    newTrack.instrumentName = "Sampler: " + userSamples_[sampleIdx].name;
+                    // Create sampler instance and load sample
+                    newTrack.sampler = std::make_shared<Sampler>(engine_->getSampleRate());
+                    newTrack.sampler->loadSample(userSamples_[sampleIdx].path);
+                    tracks_.push_back(std::move(newTrack));
+                    selectedTrackIndex_ = tracks_.size() - 1;
+                    markDirty();
+                }
+            }
+        }
+        // Accept Waveform instruments
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("WAVEFORM")) {
+            if (payload->DataSize == sizeof(Waveform)) {
+                Waveform wave = *(Waveform*)payload->Data;
+                Track newTrack;
+                newTrack.colorIndex = static_cast<int>(tracks_.size() % 24);
+                newTrack.synth = std::make_shared<Synthesizer>(engine_->getSampleRate());
+                newTrack.synth->setVolume(0.5f);
+                newTrack.oscillators.push_back(Oscillator(wave, 1.0f, 0.5f));
+                newTrack.synth->setOscillators(newTrack.oscillators);
+                const char* waveNames[] = { "Sine", "Square", "Sawtooth", "Triangle" };
+                newTrack.instrumentName = waveNames[static_cast<int>(wave)];
+                tracks_.push_back(std::move(newTrack));
+                selectedTrackIndex_ = tracks_.size() - 1;
+                markDirty();
+            }
+        }
+        // Accept Instrument presets
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("INSTRUMENT_PRESET")) {
+            if (payload->DataSize == sizeof(size_t)) {
+                size_t presetIdx = *(size_t*)payload->Data;
+                if (presetIdx < instrumentPresets_.size()) {
+                    Track newTrack;
+                    newTrack.colorIndex = static_cast<int>(tracks_.size() % 24);
+                    newTrack.synth = std::make_shared<Synthesizer>(engine_->getSampleRate());
+                    newTrack.synth->setVolume(0.5f);
+                    newTrack.oscillators = instrumentPresets_[presetIdx].oscillators;
+                    newTrack.synth->setOscillators(newTrack.oscillators);
+                    newTrack.synth->setEnvelope(instrumentPresets_[presetIdx].envelope);
+                    newTrack.instrumentName = instrumentPresets_[presetIdx].name;
+                    tracks_.push_back(std::move(newTrack));
+                    selectedTrackIndex_ = tracks_.size() - 1;
+                    markDirty();
+                }
+            }
+        }
+        ImGui::EndDragDropTarget();
     }
     
     ImGui::Dummy(ImVec2(addColumnWidth, addBtnSize.y + 8.0f));
@@ -6853,14 +7394,14 @@ void MainWindow::loadSamplesFromDirectory() {
     // Create samples directory if it doesn't exist
     std::filesystem::create_directories("samples");
     
-    // Scan for WAV files
+    // Scan for WAV and MP3 files
     try {
         for (const auto& entry : std::filesystem::directory_iterator("samples")) {
             if (entry.is_regular_file()) {
                 std::string ext = entry.path().extension().string();
                 std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
                 
-                if (ext == ".wav") {
+                if (ext == ".wav" || ext == ".mp3") {
                     SampleInfo info;
                     info.path = entry.path().string();
                     info.name = entry.path().stem().string();

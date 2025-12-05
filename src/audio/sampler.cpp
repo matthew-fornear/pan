@@ -5,6 +5,11 @@
 #include <cmath>
 #include <cstring>
 
+// MP3 decoding support
+#define MINIMP3_IMPLEMENTATION
+#include "minimp3.h"
+#include "minimp3_ex.h"
+
 namespace pan {
 
 void Sample::generateWaveformDisplay() {
@@ -80,10 +85,83 @@ bool Sampler::parseWavHeader(const std::vector<uint8_t>& data, int& channels, in
     return false;
 }
 
+bool Sampler::loadMp3(const std::string& path) {
+    mp3dec_t mp3d;
+    mp3dec_file_info_t info;
+    
+    if (mp3dec_load(&mp3d, path.c_str(), &info, NULL, NULL)) {
+        std::cerr << "Sampler: Failed to decode MP3: " << path << std::endl;
+        return false;
+    }
+    
+    if (info.samples == 0) {
+        std::cerr << "Sampler: MP3 has no samples: " << path << std::endl;
+        free(info.buffer);
+        return false;
+    }
+    
+    // Create new sample
+    auto newSample = std::make_unique<Sample>();
+    newSample->sampleRate = info.hz;
+    newSample->stereo = (info.channels == 2);
+    newSample->filePath = path;
+    
+    // Extract filename as name
+    size_t lastSlash = path.find_last_of("/\\");
+    newSample->name = (lastSlash != std::string::npos) ? path.substr(lastSlash + 1) : path;
+    // Remove extension
+    size_t dotPos = newSample->name.rfind('.');
+    if (dotPos != std::string::npos) {
+        newSample->name = newSample->name.substr(0, dotPos);
+    }
+    
+    // Convert to float format
+    size_t numFrames = info.samples / info.channels;
+    newSample->dataL.resize(numFrames);
+    if (info.channels == 2) {
+        newSample->dataR.resize(numFrames);
+    }
+    
+    // minimp3 outputs interleaved int16_t samples
+    for (size_t i = 0; i < numFrames; ++i) {
+        newSample->dataL[i] = info.buffer[i * info.channels] / 32768.0f;
+        if (info.channels == 2) {
+            newSample->dataR[i] = info.buffer[i * info.channels + 1] / 32768.0f;
+        }
+    }
+    
+    free(info.buffer);
+    
+    // Generate waveform display
+    newSample->generateWaveformDisplay();
+    
+    sample_ = std::move(newSample);
+    voice_.active = false;
+    
+    std::cout << "Sampler: Loaded MP3 '" << sample_->name << "' (" 
+              << numFrames << " frames, " << info.channels << " ch, " 
+              << info.hz << " Hz)" << std::endl;
+    
+    return true;
+}
+
 bool Sampler::loadSample(const std::string& path) {
     std::lock_guard<std::mutex> lock(mutex_);
     
-    // Read entire file
+    // Detect file type by extension
+    std::string ext;
+    size_t dotPos = path.rfind('.');
+    if (dotPos != std::string::npos) {
+        ext = path.substr(dotPos);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    }
+    
+    // Handle MP3 files
+    if (ext == ".mp3") {
+        return loadMp3(path);
+    }
+    
+    // Read entire file for WAV
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         std::cerr << "Sampler: Cannot open file: " << path << std::endl;
@@ -115,9 +193,12 @@ bool Sampler::loadSample(const std::string& path) {
     // Extract filename as name
     size_t lastSlash = path.find_last_of("/\\");
     newSample->name = (lastSlash != std::string::npos) ? path.substr(lastSlash + 1) : path;
-    // Remove .wav extension
-    if (newSample->name.size() > 4 && newSample->name.substr(newSample->name.size() - 4) == ".wav") {
-        newSample->name = newSample->name.substr(0, newSample->name.size() - 4);
+    // Remove extension
+    {
+        size_t extDotPos = newSample->name.rfind('.');
+        if (extDotPos != std::string::npos) {
+            newSample->name = newSample->name.substr(0, extDotPos);
+        }
     }
     
     // Convert audio data
