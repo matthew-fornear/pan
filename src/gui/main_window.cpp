@@ -597,8 +597,21 @@ bool MainWindow::initializeAudio() {
                             // If this event falls within the current buffer, trigger it
                             if (absoluteSamplePos >= currentPlaybackPos && 
                                 absoluteSamplePos < currentPlaybackPos + static_cast<int64_t>(numFrames)) {
-                                // Route to sampler if track has one, otherwise to synth
-                                if (track.hasSampler && track.sampler) {
+                                // Route to appropriate instrument
+                                if (track.hasDrumKit && track.drumKit) {
+                                    // Route to drum kit - find pad for this MIDI note
+                                    int note = event.message.getNoteNumber();
+                                    DrumPad* pad = track.drumKit->getPadForNote(note);
+                                    if (pad && pad->sampler && !pad->samplePath.empty()) {
+                                        if (!pad->muted) {  // Respect mute
+                                            if (event.message.getType() == MidiMessageType::NoteOn) {
+                                                pad->sampler->noteOn(60, event.message.getVelocity());
+                                            } else if (event.message.getType() == MidiMessageType::NoteOff) {
+                                                pad->sampler->noteOff(60);
+                                            }
+                                        }
+                                    }
+                                } else if (track.hasSampler && track.sampler) {
                                     if (event.message.getType() == MidiMessageType::NoteOn) {
                                         track.sampler->noteOn(event.message.getNoteNumber(), event.message.getVelocity());
                                     } else if (event.message.getType() == MidiMessageType::NoteOff) {
@@ -631,13 +644,55 @@ bool MainWindow::initializeAudio() {
                 
                 AudioBuffer trackBuffer(output.getNumChannels(), numFrames);
                 
-                // Use sampler for audio if track has sampler, otherwise use synth
-                if (track.hasSampler && track.sampler) {
+                // Use appropriate instrument for audio
+                if (track.hasDrumKit && track.drumKit) {
+                    // Process all drum pads and mix them
+                    float* leftOut = trackBuffer.getWritePointer(0);
+                    float* rightOut = trackBuffer.getNumChannels() > 1 ? trackBuffer.getWritePointer(1) : leftOut;
+                    
+                    // Clear buffer first
+                    for (size_t i = 0; i < numFrames; ++i) {
+                        leftOut[i] = 0.0f;
+                        if (rightOut != leftOut) rightOut[i] = 0.0f;
+                    }
+                    
+                    // Check for solo
+                    bool anyPadSolo = false;
+                    for (const auto& pad : track.drumKit->pads) {
+                        if (pad.solo) { anyPadSolo = true; break; }
+                    }
+                    
+                    // Mix all pads
+                    std::vector<float> padLeft(numFrames, 0.0f);
+                    std::vector<float> padRight(numFrames, 0.0f);
+                    
+                    for (auto& pad : track.drumKit->pads) {
+                        if (pad.muted || (anyPadSolo && !pad.solo)) continue;
+                        if (!pad.sampler || pad.samplePath.empty()) continue;
+                        
+                        // Process pad's sampler
+                        std::fill(padLeft.begin(), padLeft.end(), 0.0f);
+                        std::fill(padRight.begin(), padRight.end(), 0.0f);
+                        pad.sampler->process(padLeft.data(), padRight.data(), numFrames);
+                        
+                        // Apply pad volume and pan
+                        float vol = pad.volume;
+                        float panL = (pad.pan <= 0) ? 1.0f : (1.0f - pad.pan);
+                        float panR = (pad.pan >= 0) ? 1.0f : (1.0f + pad.pan);
+                        
+                        for (size_t i = 0; i < numFrames; ++i) {
+                            leftOut[i] += padLeft[i] * vol * panL;
+                            if (rightOut != leftOut) {
+                                rightOut[i] += padRight[i] * vol * panR;
+                            }
+                        }
+                    }
+                } else if (track.hasSampler && track.sampler) {
                     float* leftOut = trackBuffer.getWritePointer(0);
                     float* rightOut = trackBuffer.getNumChannels() > 1 ? trackBuffer.getWritePointer(1) : leftOut;
                     track.sampler->process(leftOut, rightOut, numFrames);
                 } else if (track.synth) {
-                track.synth->generateAudio(trackBuffer, numFrames);
+                    track.synth->generateAudio(trackBuffer, numFrames);
                 }
                 
                 // Apply effects chain
@@ -1309,6 +1364,74 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
         ImGui::PopStyleColor(2);
     }
     
+    // Drum Rack section - 16-pad drum machine like Ableton
+    if (ImGui::CollapsingHeader("Drum Rack", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.2f, 0.15f, 1.0f));
+        
+        // Draggable Drum Rack instrument
+        ImGui::PushID("drumrack_drag");
+        if (ImGui::Selectable("Drum Rack", false, 0, ImVec2(0, 22))) {
+            // Click to add to selected track
+            if (!tracks_.empty() && selectedTrackIndex_ < tracks_.size()) {
+                auto& track = tracks_[selectedTrackIndex_];
+                track.hasDrumKit = true;
+                track.hasSampler = false;
+                track.oscillators.clear();
+                track.drumKit = std::make_shared<DrumKit>();
+                track.instrumentName = "Drum Rack";
+                // Initialize samplers for each pad
+                double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                for (auto& pad : track.drumKit->pads) {
+                    pad.sampler = std::make_shared<Sampler>(sampleRate);
+                }
+                markDirty();
+            }
+        }
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+            int dummy = 0;
+            ImGui::SetDragDropPayload("DRUMRACK", &dummy, sizeof(int));
+            ImGui::Text("Add Drum Rack");
+            ImGui::EndDragDropSource();
+        }
+        ImGui::PopID();
+        
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Kits:");
+        
+        // Basic drum kit presets
+        const char* kitPresets[] = { "808 Kit", "909 Kit", "Acoustic Kit", "Lo-Fi Kit" };
+        for (int i = 0; i < 4; ++i) {
+            ImGui::PushID(15000 + i);
+            if (ImGui::Selectable(kitPresets[i], false, 0, ImVec2(0, 20))) {
+                // Create drum rack with preset kit
+                if (!tracks_.empty() && selectedTrackIndex_ < tracks_.size()) {
+                    auto& track = tracks_[selectedTrackIndex_];
+                    track.hasDrumKit = true;
+                    track.hasSampler = false;
+                    track.oscillators.clear();
+                    track.drumKit = std::make_shared<DrumKit>();
+                    track.drumKit->name = kitPresets[i];
+                    track.instrumentName = std::string("Drum Rack: ") + kitPresets[i];
+                    double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                    for (auto& pad : track.drumKit->pads) {
+                        pad.sampler = std::make_shared<Sampler>(sampleRate);
+                    }
+                    markDirty();
+                }
+            }
+            if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                int payload = i;
+                ImGui::SetDragDropPayload("DRUMKIT_PRESET", &payload, sizeof(int));
+                ImGui::Text("Add %s", kitPresets[i]);
+                ImGui::EndDragDropSource();
+            }
+            ImGui::PopID();
+        }
+        
+        ImGui::PopStyleColor(2);
+    }
+    
     // Effects section - with expandable preset lists like Instruments
     if (ImGui::CollapsingHeader("Effects", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
@@ -1752,13 +1875,17 @@ void MainWindow::renderComponents(ImGuiID target_dock_id) {
                 ImGui::Separator();
                 ImGui::Spacing();
                 
-                // Render unified instrument/sampler panel
+                // Render unified instrument/sampler/drum rack panel
                 auto& oscillators = tracks_[selectedTrackIndex_].oscillators;
                 bool hasSampler = tracks_[selectedTrackIndex_].hasSampler;
-                bool hasInstrument = !oscillators.empty() || hasSampler;
+                bool hasDrumKit = tracks_[selectedTrackIndex_].hasDrumKit;
+                bool hasInstrument = !oscillators.empty() || hasSampler || hasDrumKit;
                 
                 if (hasInstrument) {
-                    if (hasSampler) {
+                    if (hasDrumKit) {
+                        // Render Drum Rack panel (16-pad grid like Ableton)
+                        renderDrumRackPanel(selectedTrackIndex_);
+                    } else if (hasSampler) {
                         // Render unified Sampler panel with tabs for Sample and synth controls
                         renderSamplerPanel(selectedTrackIndex_);
                     } else {
@@ -2844,6 +2971,264 @@ void MainWindow::renderSamplerPanel(size_t trackIndex) {
 #endif
 }
 
+void MainWindow::renderDrumRackPanel(size_t trackIndex) {
+#ifdef PAN_USE_GUI
+    if (trackIndex >= tracks_.size()) return;
+    auto& track = tracks_[trackIndex];
+    if (!track.hasDrumKit || !track.drumKit) return;
+    
+    auto& kit = *track.drumKit;
+    
+    // Panel dimensions - Ableton-like compact layout
+    float panelWidth = ImGui::GetContentRegionAvail().x;
+    float panelHeight = 260.0f;
+    
+    ImVec2 startPos = ImGui::GetCursorScreenPos();
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    
+    // Panel background
+    ImU32 bgColor = IM_COL32(28, 28, 28, 255);
+    ImU32 borderColor = IM_COL32(60, 60, 60, 255);
+    ImU32 accentOrange = IM_COL32(255, 149, 0, 255);
+    ImU32 padBg = IM_COL32(40, 40, 40, 255);
+    ImU32 padHover = IM_COL32(60, 60, 60, 255);
+    ImU32 padActive = IM_COL32(255, 149, 0, 180);
+    ImU32 textColor = IM_COL32(200, 200, 200, 255);
+    ImU32 textDim = IM_COL32(120, 120, 120, 255);
+    
+    drawList->AddRectFilled(startPos, ImVec2(startPos.x + panelWidth, startPos.y + panelHeight),
+                           bgColor, 4.0f);
+    drawList->AddRect(startPos, ImVec2(startPos.x + panelWidth, startPos.y + panelHeight),
+                     borderColor, 4.0f);
+    
+    // Header bar
+    float headerH = 22.0f;
+    drawList->AddRectFilled(startPos, ImVec2(startPos.x + panelWidth, startPos.y + headerH),
+                           accentOrange, 4.0f, ImDrawFlags_RoundCornersTop);
+    drawList->AddText(ImVec2(startPos.x + 8, startPos.y + 3), IM_COL32(0, 0, 0, 255), kit.name.c_str());
+    
+    // Layout: Left side = 4x4 pad grid, Right side = selected pad controls
+    float padAreaWidth = 200.0f;
+    float controlAreaX = startPos.x + padAreaWidth + 10;
+    float controlAreaWidth = panelWidth - padAreaWidth - 20;
+    float contentY = startPos.y + headerH + 8;
+    
+    // Draw 4x4 pad grid
+    float padSize = 42.0f;
+    float padSpacing = 4.0f;
+    float gridStartX = startPos.x + 10;
+    float gridStartY = contentY;
+    
+    // Note names for display (C1 to D#2)
+    const char* noteNames[] = { "C1", "C#1", "D1", "D#1", "E1", "F1", "F#1", "G1", 
+                                "G#1", "A1", "A#1", "B1", "C2", "C#2", "D2", "D#2" };
+    
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            int padIdx = (3 - row) * 4 + col;  // Bottom-left is pad 0 (C1)
+            auto& pad = kit.pads[padIdx];
+            
+            float px = gridStartX + col * (padSize + padSpacing);
+            float py = gridStartY + row * (padSize + padSpacing);
+            ImVec2 padMin(px, py);
+            ImVec2 padMax(px + padSize, py + padSize);
+            
+            ImGui::SetCursorScreenPos(padMin);
+            ImGui::PushID(padIdx);
+            ImGui::InvisibleButton("##pad", ImVec2(padSize, padSize));
+            
+            bool hovered = ImGui::IsItemHovered();
+            bool active = ImGui::IsItemActive();
+            bool clicked = ImGui::IsItemClicked();
+            
+            // Select pad on click
+            if (clicked) {
+                kit.selectedPad = padIdx;
+            }
+            
+            // Trigger sample on click
+            if (active && pad.sampler && !pad.samplePath.empty()) {
+                pad.sampler->noteOn(60, 100);  // Trigger at middle C velocity
+            }
+            
+            // Draw pad
+            bool isSelected = kit.selectedPad == padIdx;
+            bool hasSample = !pad.samplePath.empty();
+            ImU32 bgCol = active ? padActive : (hovered ? padHover : (isSelected ? IM_COL32(80, 60, 20, 255) : padBg));
+            drawList->AddRectFilled(padMin, padMax, bgCol, 4.0f);
+            
+            if (isSelected) {
+                drawList->AddRect(padMin, padMax, accentOrange, 4.0f, 0, 2.0f);
+            }
+            
+            // Pad label
+            const char* label = hasSample ? pad.sampleName.c_str() : noteNames[padIdx];
+            ImVec2 labelSize = ImGui::CalcTextSize(label);
+            // Truncate long names
+            std::string displayLabel = label;
+            if (labelSize.x > padSize - 4) {
+                while (displayLabel.length() > 3 && ImGui::CalcTextSize(displayLabel.c_str()).x > padSize - 4) {
+                    displayLabel = displayLabel.substr(0, displayLabel.length() - 4) + "..";
+                }
+            }
+            ImVec2 textPos(px + (padSize - ImGui::CalcTextSize(displayLabel.c_str()).x) / 2, 
+                          py + padSize - 14);
+            drawList->AddText(textPos, hasSample ? textColor : textDim, displayLabel.c_str());
+            
+            // Mute/Solo indicators
+            if (pad.muted) {
+                drawList->AddCircleFilled(ImVec2(px + padSize - 6, py + 6), 4, IM_COL32(255, 100, 100, 200));
+            }
+            if (pad.solo) {
+                drawList->AddCircleFilled(ImVec2(px + padSize - 14, py + 6), 4, IM_COL32(255, 200, 0, 200));
+            }
+            
+            // Drop target for samples
+            if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("SAMPLE")) {
+                    if (payload->DataSize == sizeof(size_t)) {
+                        size_t sampleIdx = *(size_t*)payload->Data;
+                        if (sampleIdx < userSamples_.size()) {
+                            pad.samplePath = userSamples_[sampleIdx].path;
+                            pad.sampleName = userSamples_[sampleIdx].name;
+                            pad.waveform = userSamples_[sampleIdx].waveformDisplay;
+                            if (pad.sampler) {
+                                pad.sampler->loadSample(pad.samplePath);
+                            }
+                            markDirty();
+                        }
+                    }
+                }
+                ImGui::EndDragDropTarget();
+            }
+            
+            ImGui::PopID();
+        }
+    }
+    
+    // Right side: Selected pad controls
+    auto& selectedPad = kit.pads[kit.selectedPad];
+    float ctrlY = contentY;
+    
+    // Pad info header
+    ImGui::SetCursorScreenPos(ImVec2(controlAreaX, ctrlY));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.58f, 0.0f, 1.0f));
+    ImGui::Text("Pad %d: %s", kit.selectedPad + 1, noteNames[kit.selectedPad]);
+    ImGui::PopStyleColor();
+    ctrlY += 20;
+    
+    // Waveform display for selected pad
+    float waveW = controlAreaWidth - 10;
+    float waveH = 50.0f;
+    ImVec2 waveMin(controlAreaX, ctrlY);
+    ImVec2 waveMax(controlAreaX + waveW, ctrlY + waveH);
+    
+    drawList->AddRectFilled(waveMin, waveMax, IM_COL32(20, 20, 20, 255), 2.0f);
+    
+    if (!selectedPad.waveform.empty()) {
+        float centerY = waveMin.y + waveH / 2;
+        float xStep = waveW / selectedPad.waveform.size();
+        for (size_t i = 0; i < selectedPad.waveform.size(); ++i) {
+            float x = waveMin.x + i * xStep;
+            float amp = selectedPad.waveform[i] * (waveH / 2 - 2);
+            drawList->AddLine(ImVec2(x, centerY - amp), ImVec2(x, centerY + amp), accentOrange);
+        }
+    } else {
+        ImVec2 hintSize = ImGui::CalcTextSize("Drop sample");
+        drawList->AddText(ImVec2(waveMin.x + (waveW - hintSize.x) / 2, waveMin.y + (waveH - hintSize.y) / 2),
+                         textDim, "Drop sample");
+    }
+    ctrlY += waveH + 8;
+    
+    // Controls
+    ImGui::SetCursorScreenPos(ImVec2(controlAreaX, ctrlY));
+    ImGui::PushItemWidth(80);
+    
+    // Volume
+    ImGui::Text("Vol"); ImGui::SameLine();
+    float volDb = 20.0f * std::log10(std::max(0.0001f, selectedPad.volume));
+    ImGui::SetCursorScreenPos(ImVec2(controlAreaX + 30, ctrlY - 2));
+    if (ImGui::SliderFloat("##padVol", &volDb, -60.0f, 12.0f, "%.1f dB")) {
+        selectedPad.volume = std::pow(10.0f, volDb / 20.0f);
+        markDirty();
+    }
+    ctrlY += 24;
+    
+    // Pan
+    ImGui::SetCursorScreenPos(ImVec2(controlAreaX, ctrlY));
+    ImGui::Text("Pan"); ImGui::SameLine();
+    ImGui::SetCursorScreenPos(ImVec2(controlAreaX + 30, ctrlY - 2));
+    if (ImGui::SliderFloat("##padPan", &selectedPad.pan, -1.0f, 1.0f, "%.2f")) {
+        markDirty();
+    }
+    ctrlY += 24;
+    
+    // Pitch
+    ImGui::SetCursorScreenPos(ImVec2(controlAreaX, ctrlY));
+    ImGui::Text("Tune"); ImGui::SameLine();
+    ImGui::SetCursorScreenPos(ImVec2(controlAreaX + 30, ctrlY - 2));
+    if (ImGui::SliderFloat("##padPitch", &selectedPad.pitch, -24.0f, 24.0f, "%.1f st")) {
+        markDirty();
+    }
+    ctrlY += 24;
+    
+    // Mute and Solo buttons
+    ImGui::SetCursorScreenPos(ImVec2(controlAreaX, ctrlY));
+    ImGui::PushStyleColor(ImGuiCol_Button, selectedPad.muted ? ImVec4(0.8f, 0.3f, 0.3f, 1.0f) : ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
+    if (ImGui::Button("M", ImVec2(24, 20))) {
+        selectedPad.muted = !selectedPad.muted;
+        markDirty();
+    }
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Button, selectedPad.solo ? ImVec4(0.7f, 0.6f, 0.1f, 1.0f) : ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
+    if (ImGui::Button("S", ImVec2(24, 20))) {
+        selectedPad.solo = !selectedPad.solo;
+        markDirty();
+    }
+    ImGui::PopStyleColor();
+    
+    // Sample name
+    if (!selectedPad.samplePath.empty()) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s", selectedPad.sampleName.c_str());
+    }
+    ctrlY += 28;
+    
+    // ADSR section
+    ImGui::SetCursorScreenPos(ImVec2(controlAreaX, ctrlY));
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "ADSR");
+    ctrlY += 18;
+    
+    ImGui::SetCursorScreenPos(ImVec2(controlAreaX, ctrlY));
+    float adsrW = (controlAreaWidth - 20) / 4;
+    ImGui::PushItemWidth(adsrW - 4);
+    
+    ImGui::Text("A"); ImGui::SameLine();
+    ImGui::SetCursorScreenPos(ImVec2(controlAreaX + 12, ctrlY - 2));
+    ImGui::SliderFloat("##padA", &selectedPad.attack, 0.001f, 1.0f, "");
+    ImGui::SameLine();
+    
+    ImGui::Text("D"); ImGui::SameLine();
+    ImGui::SliderFloat("##padD", &selectedPad.decay, 0.001f, 2.0f, "");
+    ImGui::SameLine();
+    
+    ImGui::Text("S"); ImGui::SameLine();
+    ImGui::SliderFloat("##padS", &selectedPad.sustain, 0.0f, 1.0f, "");
+    ImGui::SameLine();
+    
+    ImGui::Text("R"); ImGui::SameLine();
+    ImGui::SliderFloat("##padR", &selectedPad.release, 0.001f, 2.0f, "");
+    
+    ImGui::PopItemWidth();
+    ImGui::PopItemWidth();
+    
+    // Set cursor to after panel
+    ImGui::SetCursorScreenPos(ImVec2(startPos.x, startPos.y + panelHeight + 4));
+    ImGui::Dummy(ImVec2(panelWidth, 1));
+#endif
+}
+
 void MainWindow::renderEffectBox(size_t trackIndex, size_t effectIndex, std::shared_ptr<Effect> effect) {
 #ifdef PAN_USE_GUI
     if (!effect) return;
@@ -3734,8 +4119,8 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
         // Row 2: I/O style indicators (subtle)
         float ioRowY = headerStartPos.y + 20.0f;
         ImGui::PushFont(ImGui::GetIO().Fonts->Fonts.Size > 0 ? ImGui::GetIO().Fonts->Fonts[0] : nullptr);
-        drawList->AddText(ImVec2(contentStartX, ioRowY), IM_COL32(100, 100, 100, 255), 
-                         tracks_[i].hasSampler ? "Smplr" : "Synth");
+        const char* trackType = tracks_[i].hasDrumKit ? "Drums" : (tracks_[i].hasSampler ? "Smplr" : "Synth");
+        drawList->AddText(ImVec2(contentStartX, ioRowY), IM_COL32(100, 100, 100, 255), trackType);
         ImGui::PopFont();
         
         // Row 3: S M ● buttons, then Vol/Pan displays
@@ -4254,13 +4639,47 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
             // Accept Sampler drops on track headers
             if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("SIMPLER")) {
                 tracks_[i].hasSampler = true;
+                tracks_[i].hasDrumKit = false;
+                tracks_[i].drumKit.reset();
                 tracks_[i].samplerSamplePath = "";
                 tracks_[i].samplerWaveform.clear();
-                tracks_[i].oscillators.clear();  // Clear oscillators when loading sampler
+                tracks_[i].oscillators.clear();
                 tracks_[i].instrumentName = "Sampler";
-                // Create sampler instance
                 double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
                 tracks_[i].sampler = std::make_shared<Sampler>(sampleRate);
+                selectedTrackIndex_ = i;
+                markDirty();
+            }
+            // Accept Drum Rack drops on track headers
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("DRUMRACK")) {
+                tracks_[i].hasDrumKit = true;
+                tracks_[i].hasSampler = false;
+                tracks_[i].sampler.reset();
+                tracks_[i].oscillators.clear();
+                tracks_[i].drumKit = std::make_shared<DrumKit>();
+                tracks_[i].instrumentName = "Drum Rack";
+                double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                for (auto& pad : tracks_[i].drumKit->pads) {
+                    pad.sampler = std::make_shared<Sampler>(sampleRate);
+                }
+                selectedTrackIndex_ = i;
+                markDirty();
+            }
+            // Accept Drum Kit preset drops
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("DRUMKIT_PRESET")) {
+                const char* kitNames[] = { "808 Kit", "909 Kit", "Acoustic Kit", "Lo-Fi Kit" };
+                int presetIdx = *(int*)payload->Data;
+                tracks_[i].hasDrumKit = true;
+                tracks_[i].hasSampler = false;
+                tracks_[i].sampler.reset();
+                tracks_[i].oscillators.clear();
+                tracks_[i].drumKit = std::make_shared<DrumKit>();
+                tracks_[i].drumKit->name = kitNames[presetIdx];
+                tracks_[i].instrumentName = std::string("Drum Rack: ") + kitNames[presetIdx];
+                double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                for (auto& pad : tracks_[i].drumKit->pads) {
+                    pad.sampler = std::make_shared<Sampler>(sampleRate);
+                }
                 selectedTrackIndex_ = i;
                 markDirty();
             }
@@ -4382,8 +4801,44 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
             newTrack.hasSampler = true;
             newTrack.oscillators.clear();
             newTrack.instrumentName = "Sampler";
-            // Create sampler instance
             newTrack.sampler = std::make_shared<Sampler>(engine_->getSampleRate());
+            tracks_.push_back(std::move(newTrack));
+            selectedTrackIndex_ = tracks_.size() - 1;
+            markDirty();
+        }
+        // Accept Drum Rack
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("DRUMRACK")) {
+            Track newTrack;
+            newTrack.colorIndex = static_cast<int>(tracks_.size() % 24);
+            newTrack.synth = std::make_shared<Synthesizer>(engine_->getSampleRate());
+            newTrack.synth->setVolume(0.5f);
+            newTrack.hasDrumKit = true;
+            newTrack.oscillators.clear();
+            newTrack.instrumentName = "Drum Rack";
+            newTrack.drumKit = std::make_shared<DrumKit>();
+            for (auto& pad : newTrack.drumKit->pads) {
+                pad.sampler = std::make_shared<Sampler>(engine_->getSampleRate());
+            }
+            tracks_.push_back(std::move(newTrack));
+            selectedTrackIndex_ = tracks_.size() - 1;
+            markDirty();
+        }
+        // Accept Drum Kit preset
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("DRUMKIT_PRESET")) {
+            const char* kitNames[] = { "808 Kit", "909 Kit", "Acoustic Kit", "Lo-Fi Kit" };
+            int presetIdx = *(int*)payload->Data;
+            Track newTrack;
+            newTrack.colorIndex = static_cast<int>(tracks_.size() % 24);
+            newTrack.synth = std::make_shared<Synthesizer>(engine_->getSampleRate());
+            newTrack.synth->setVolume(0.5f);
+            newTrack.hasDrumKit = true;
+            newTrack.oscillators.clear();
+            newTrack.drumKit = std::make_shared<DrumKit>();
+            newTrack.drumKit->name = kitNames[presetIdx];
+            newTrack.instrumentName = std::string("Drum Rack: ") + kitNames[presetIdx];
+            for (auto& pad : newTrack.drumKit->pads) {
+                pad.sampler = std::make_shared<Sampler>(engine_->getSampleRate());
+            }
             tracks_.push_back(std::move(newTrack));
             selectedTrackIndex_ = tracks_.size() - 1;
             markDirty();
@@ -8124,6 +8579,278 @@ void MainWindow::initializeInstrumentPresets() {
                 Oscillator(Waveform::Sine, 0.5f, 0.35f)
             },
             envMemory
+        ));
+    }
+    
+    // === FLYING LOTUS / APHEX TWIN INSPIRED ===
+    // Experimental electronic sounds with complex modulation and textures
+    
+    // Glitch Bass - Distorted, unstable bass with rapid modulation
+    {
+        InstrumentEnvelope envGlitch;
+        envGlitch.ampEnvelope = ADSREnvelope(0.001f, 0.15f, 0.6f, 0.2f);
+        envGlitch.pitchEnvelope = PitchEnvelope(4.0f, 0.03f);  // Sharp pitch drop
+        envGlitch.filter.enabled = true;
+        envGlitch.filter.cutoff = 0.35f;
+        envGlitch.filter.resonance = 0.4f;
+        envGlitch.saturation.enabled = true;
+        envGlitch.saturation.drive = 5.0f;
+        envGlitch.saturation.mix = 0.6f;
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Glitch Bass",
+            "FlyLo",
+            {
+                Oscillator(Waveform::Square, 0.5f, 0.7f),
+                Oscillator(Waveform::Sawtooth, 0.502f, 0.5f),  // Slight detune for instability
+                Oscillator(Waveform::Sine, 0.25f, 0.6f),
+                Oscillator(Waveform::Square, 1.5f, 0.15f)  // Grit
+            },
+            envGlitch
+        ));
+    }
+    
+    // Warped Rhodes - Processed electric piano with tape wobble character
+    {
+        InstrumentEnvelope envWarped;
+        envWarped.ampEnvelope = ADSREnvelope(0.005f, 1.8f, 0.35f, 1.2f);
+        envWarped.lfo1 = LFO(0.4f, 0.08f, LFO::Target::Pitch);  // Subtle warble
+        envWarped.filter.enabled = true;
+        envWarped.filter.cutoff = 0.5f;
+        envWarped.filter.resonance = 0.15f;
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Warped Rhodes",
+            "FlyLo",
+            {
+                Oscillator(Waveform::Sine, 1.0f, 0.55f),
+                Oscillator(Waveform::Sine, 2.0f, 0.25f),
+                Oscillator(Waveform::Triangle, 1.414f, 0.2f),  // Inharmonic bell tone
+                Oscillator(Waveform::Sine, 3.0f, 0.1f),
+                Oscillator(Waveform::Sine, 0.998f, 0.15f)  // Chorus effect
+            },
+            envWarped
+        ));
+    }
+    
+    // IDM Lead - Aggressive, detuned lead with fast modulation (Aphex style)
+    {
+        InstrumentEnvelope envIDM;
+        envIDM.ampEnvelope = ADSREnvelope(0.002f, 0.08f, 0.75f, 0.12f);
+        envIDM.lfo1 = LFO(12.0f, 0.04f, LFO::Target::Pitch);  // Fast vibrato
+        envIDM.filter.enabled = true;
+        envIDM.filter.cutoff = 0.65f;
+        envIDM.filter.resonance = 0.35f;
+        instrumentPresets_.push_back(InstrumentPreset(
+            "IDM Lead",
+            "Aphex",
+            {
+                Oscillator(Waveform::Sawtooth, 1.0f, 0.45f),
+                Oscillator(Waveform::Sawtooth, 1.007f, 0.35f),
+                Oscillator(Waveform::Sawtooth, 0.993f, 0.35f),
+                Oscillator(Waveform::Square, 2.0f, 0.2f),
+                Oscillator(Waveform::Sine, 0.5f, 0.15f)
+            },
+            envIDM
+        ));
+    }
+    
+    // Braindance Stab - Sharp, metallic stab (Aphex/Autechre style)
+    {
+        InstrumentEnvelope envStab;
+        envStab.ampEnvelope = ADSREnvelope(0.0005f, 0.12f, 0.0f, 0.08f);
+        envStab.pitchEnvelope = PitchEnvelope(1.8f, 0.02f);
+        envStab.filter.enabled = true;
+        envStab.filter.cutoff = 0.75f;
+        envStab.filter.resonance = 0.5f;
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Braindance Stab",
+            "Aphex",
+            {
+                Oscillator(Waveform::Square, 1.0f, 0.5f),
+                Oscillator(Waveform::Sawtooth, 1.5f, 0.4f),
+                Oscillator(Waveform::Square, 2.333f, 0.3f),  // Inharmonic
+                Oscillator(Waveform::Sawtooth, 3.14f, 0.2f)
+            },
+            envStab
+        ));
+    }
+    
+    // Ethereal Haze - Dreamy, heavily modulated pad
+    {
+        InstrumentEnvelope envHaze;
+        envHaze.ampEnvelope = ADSREnvelope(2.5f, 1.5f, 0.7f, 4.0f);
+        envHaze.lfo1 = LFO(0.08f, 0.12f, LFO::Target::Pitch);
+        envHaze.lfo2 = LFO(0.13f, 0.4f, LFO::Target::Amplitude);
+        envHaze.filter.enabled = true;
+        envHaze.filter.cutoff = 0.4f;
+        envHaze.filter.resonance = 0.2f;
+        envHaze.unison.enabled = true;
+        envHaze.unison.voices = 4;
+        envHaze.unison.detune = 25.0f;
+        envHaze.unison.spread = 0.9f;
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Ethereal Haze",
+            "FlyLo",
+            {
+                Oscillator(Waveform::Sine, 1.0f, 0.4f),
+                Oscillator(Waveform::Triangle, 2.0f, 0.25f),
+                Oscillator(Waveform::Sine, 3.0f, 0.15f),
+                Oscillator(Waveform::Sine, 0.5f, 0.3f)
+            },
+            envHaze
+        ));
+    }
+    
+    // Granular Texture - Evolving, glitchy texture pad
+    {
+        InstrumentEnvelope envGranular;
+        envGranular.ampEnvelope = ADSREnvelope(0.8f, 0.4f, 0.6f, 2.0f);
+        envGranular.lfo1 = LFO(0.7f, 0.06f, LFO::Target::Pitch);  // Subtle grain-like movement
+        envGranular.lfo2 = LFO(0.23f, 0.35f, LFO::Target::Amplitude);
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Granular Texture",
+            "FlyLo",
+            {
+                Oscillator(Waveform::Triangle, 1.0f, 0.3f, -25.0f),
+                Oscillator(Waveform::Triangle, 1.0f, 0.3f, +25.0f),
+                Oscillator(Waveform::Sine, 1.618f, 0.2f),  // Golden ratio
+                Oscillator(Waveform::Square, 2.0f, 0.1f),
+                Oscillator(Waveform::Sine, 0.5f, 0.25f)
+            },
+            envGranular
+        ));
+    }
+    
+    // Drill n Bass - Fast, aggressive bass for drill/jungle (Aphex style)
+    {
+        InstrumentEnvelope envDrill;
+        envDrill.ampEnvelope = ADSREnvelope(0.001f, 0.08f, 0.5f, 0.1f);
+        envDrill.pitchEnvelope = PitchEnvelope(2.5f, 0.015f);
+        envDrill.filter.enabled = true;
+        envDrill.filter.cutoff = 0.5f;
+        envDrill.filter.resonance = 0.3f;
+        envDrill.saturation.enabled = true;
+        envDrill.saturation.drive = 3.0f;
+        envDrill.saturation.mix = 0.4f;
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Drill n Bass",
+            "Aphex",
+            {
+                Oscillator(Waveform::Sawtooth, 0.5f, 0.6f),
+                Oscillator(Waveform::Square, 0.5f, 0.4f),
+                Oscillator(Waveform::Sine, 0.25f, 0.5f),
+                Oscillator(Waveform::Sawtooth, 1.0f, 0.2f)
+            },
+            envDrill
+        ));
+    }
+    
+    // Melancholic Keys - Sad, detuned piano-like tone
+    {
+        InstrumentEnvelope envMelancholy;
+        envMelancholy.ampEnvelope = ADSREnvelope(0.01f, 2.0f, 0.25f, 1.5f);
+        envMelancholy.lfo1 = LFO(0.15f, 0.03f, LFO::Target::Pitch);
+        envMelancholy.filter.enabled = true;
+        envMelancholy.filter.cutoff = 0.45f;
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Melancholic Keys",
+            "FlyLo",
+            {
+                Oscillator(Waveform::Triangle, 1.0f, 0.5f),
+                Oscillator(Waveform::Triangle, 0.998f, 0.3f),  // Chorusing
+                Oscillator(Waveform::Sine, 2.0f, 0.2f),
+                Oscillator(Waveform::Sine, 3.0f, 0.1f),
+                Oscillator(Waveform::Sine, 0.5f, 0.15f)
+            },
+            envMelancholy
+        ));
+    }
+    
+    // Acid Saw - Classic acid-style with modulation
+    {
+        InstrumentEnvelope envAcidSaw;
+        envAcidSaw.ampEnvelope = ADSREnvelope(0.001f, 0.2f, 0.6f, 0.15f);
+        envAcidSaw.filter.enabled = true;
+        envAcidSaw.filter.cutoff = 0.25f;
+        envAcidSaw.filter.resonance = 0.6f;
+        envAcidSaw.portamento.enabled = true;
+        envAcidSaw.portamento.time = 0.05f;
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Acid Saw",
+            "Aphex",
+            {
+                Oscillator(Waveform::Sawtooth, 1.0f, 0.7f),
+                Oscillator(Waveform::Sawtooth, 0.5f, 0.3f)
+            },
+            envAcidSaw
+        ));
+    }
+    
+    // Ambient Drone - Deep, evolving drone texture
+    {
+        InstrumentEnvelope envDrone;
+        envDrone.ampEnvelope = ADSREnvelope(4.0f, 2.0f, 0.8f, 6.0f);
+        envDrone.lfo1 = LFO(0.03f, 0.08f, LFO::Target::Pitch);
+        envDrone.lfo2 = LFO(0.07f, 0.3f, LFO::Target::Amplitude);
+        envDrone.filter.enabled = true;
+        envDrone.filter.cutoff = 0.3f;
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Ambient Drone",
+            "FlyLo",
+            {
+                Oscillator(Waveform::Sine, 1.0f, 0.4f, -10.0f),
+                Oscillator(Waveform::Sine, 1.0f, 0.4f, +10.0f),
+                Oscillator(Waveform::Sine, 1.5f, 0.25f),
+                Oscillator(Waveform::Triangle, 0.5f, 0.35f),
+                Oscillator(Waveform::Sine, 2.0f, 0.1f)
+            },
+            envDrone
+        ));
+    }
+    
+    // Broken Transmission - Glitchy, corrupted signal
+    {
+        InstrumentEnvelope envBroken;
+        envBroken.ampEnvelope = ADSREnvelope(0.005f, 0.3f, 0.4f, 0.5f);
+        envBroken.lfo1 = LFO(8.0f, 0.1f, LFO::Target::Pitch);  // Fast pitch jitter
+        envBroken.filter.enabled = true;
+        envBroken.filter.cutoff = 0.6f;
+        envBroken.filter.resonance = 0.4f;
+        envBroken.saturation.enabled = true;
+        envBroken.saturation.drive = 4.0f;
+        envBroken.saturation.mix = 0.5f;
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Broken Transmission",
+            "Aphex",
+            {
+                Oscillator(Waveform::Square, 1.0f, 0.4f),
+                Oscillator(Waveform::Square, 1.03f, 0.35f),
+                Oscillator(Waveform::Sawtooth, 2.5f, 0.25f),
+                Oscillator(Waveform::Triangle, 0.5f, 0.2f)
+            },
+            envBroken
+        ));
+    }
+    
+    // Tape Saturation Pad - Warm, saturated analog character
+    {
+        InstrumentEnvelope envTape;
+        envTape.ampEnvelope = ADSREnvelope(1.5f, 1.0f, 0.7f, 2.5f);
+        envTape.lfo1 = LFO(0.25f, 0.02f, LFO::Target::Pitch);  // Tape wow
+        envTape.filter.enabled = true;
+        envTape.filter.cutoff = 0.55f;
+        envTape.saturation.enabled = true;
+        envTape.saturation.drive = 2.0f;
+        envTape.saturation.mix = 0.35f;
+        instrumentPresets_.push_back(InstrumentPreset(
+            "Tape Saturation Pad",
+            "FlyLo",
+            {
+                Oscillator(Waveform::Triangle, 1.0f, 0.45f, -8.0f),
+                Oscillator(Waveform::Triangle, 1.0f, 0.45f, +8.0f),
+                Oscillator(Waveform::Sine, 2.0f, 0.2f),
+                Oscillator(Waveform::Sine, 0.5f, 0.3f)
+            },
+            envTape
         ));
     }
     

@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <vector>
+#include <array>
 #include <mutex>
 #include <set>
 #include <utility>
@@ -16,6 +17,9 @@
 typedef unsigned int ImGuiID;
 
 namespace pan {
+
+// Forward declarations
+struct DrumKit;
 
 struct Track {
     std::vector<Oscillator> oscillators;  // Multiple oscillators per track
@@ -42,6 +46,10 @@ struct Track {
     std::vector<float> samplerWaveform;  // Waveform display data for sampler
     std::shared_ptr<Sampler> sampler;  // Actual sampler instance for audio playback
     SamplerParams samplerParams;  // Sampler parameters (persisted with project)
+    
+    // Drum Kit (Drum Rack)
+    bool hasDrumKit = false;  // Track has a drum rack instrument
+    std::shared_ptr<DrumKit> drumKit;  // Drum kit instance with 16 pads
     
     // MIDI recording
     std::shared_ptr<MidiClip> recordingClip;  // Current recording clip (null when not recording)
@@ -78,6 +86,49 @@ struct SampleInfo {
     std::string name;
     std::string path;
     std::vector<float> waveformDisplay;  // For visualization
+};
+
+// Drum pad for drum rack
+struct DrumPad {
+    std::string samplePath;           // Path to sample file
+    std::string sampleName;           // Display name
+    std::vector<float> waveform;      // Waveform for display
+    float volume = 0.8f;              // Pad volume (0-1)
+    float pan = 0.0f;                 // Pan (-1 to 1)
+    float pitch = 0.0f;               // Pitch shift in semitones (-24 to +24)
+    float attack = 0.001f;            // Attack time in seconds
+    float decay = 0.5f;               // Decay time
+    float sustain = 0.0f;             // Sustain level (0 for one-shot)
+    float release = 0.1f;             // Release time
+    bool muted = false;               // Pad muted
+    bool solo = false;                // Pad soloed
+    int midiNote = 36;                // MIDI note that triggers this pad (C1 = 36)
+    std::shared_ptr<Sampler> sampler; // Sampler instance for playback
+    
+    DrumPad() = default;
+    DrumPad(int note) : midiNote(note) {}
+};
+
+// Drum kit with 16 pads (4x4 grid like Ableton)
+struct DrumKit {
+    std::string name = "Kit 1";
+    std::array<DrumPad, 16> pads;     // 16 pads, MIDI notes 36-51 (C1 to D#2)
+    int selectedPad = 0;              // Currently selected pad for editing
+    
+    DrumKit() {
+        // Initialize pad MIDI note assignments (C1 = 36 through D#2 = 51)
+        for (int i = 0; i < 16; ++i) {
+            pads[i].midiNote = 36 + i;
+        }
+    }
+    
+    // Find pad by MIDI note
+    DrumPad* getPadForNote(int note) {
+        for (auto& pad : pads) {
+            if (pad.midiNote == note) return &pad;
+        }
+        return nullptr;
+    }
 };
 
 class MainWindow {
@@ -263,6 +314,7 @@ private:
     void renderComponentBox(size_t trackIndex, size_t oscIndex, Oscillator& osc);
     void renderInstrumentPanel(size_t trackIndex);
     void renderSamplerPanel(size_t trackIndex);
+    void renderDrumRackPanel(size_t trackIndex);  // Drum rack UI similar to Ableton
     void renderVelocityEditor(float canvasX, float canvasY, float canvasWidth, float canvasHeight);
     void renderEffectBox(size_t trackIndex, size_t effectIndex, std::shared_ptr<Effect> effect);
     void renderTrackTimeline(size_t trackIndex);
