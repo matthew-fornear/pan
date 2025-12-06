@@ -22,6 +22,8 @@ struct Track {
     bool isRecording;
     bool isSolo;      // Solo button state
     bool isMuted;     // Mute button state
+    float volumeDb = 0.0f;  // Track gain in dB (0.0 default)
+    float pan = 0.0f;       // -1.0 left, 0 center, 1.0 right
     std::shared_ptr<Synthesizer> synth;
     std::string name;
     bool waveformSet;  // Track if waveform has been explicitly set via drag-and-drop (deprecated, kept for compatibility)
@@ -39,6 +41,7 @@ struct Track {
     std::string samplerSamplePath;  // Path to loaded sample (empty = waiting for sample)
     std::vector<float> samplerWaveform;  // Waveform display data for sampler
     std::shared_ptr<Sampler> sampler;  // Actual sampler instance for audio playback
+    SamplerParams samplerParams;  // Sampler parameters (persisted with project)
     
     // MIDI recording
     std::shared_ptr<MidiClip> recordingClip;  // Current recording clip (null when not recording)

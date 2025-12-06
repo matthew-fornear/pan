@@ -23,6 +23,11 @@ set(LIB_SOURCES
     src/audio/chorus.cpp
     src/audio/distortion.cpp
     src/audio/eq8.cpp
+    src/audio/sidechain_pump.cpp
+    src/audio/wow_flutter.cpp
+    src/audio/beat_repeat.cpp
+    src/audio/bit_noise_texture.cpp
+    src/audio/resonator_bank.cpp
     src/audio/sampler.cpp
     src/project/project_manager.cpp
     src/track/track.cpp

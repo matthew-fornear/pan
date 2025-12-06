@@ -614,23 +614,23 @@ void Synthesizer::generateAudio(AudioBuffer& buffer, size_t numFrames) {
                 }
                 float uniDetuneMultiplier = std::pow(2.0f, unisonDetune / 1200.0f);
                 
-                if (oscillators_.empty()) {
+            if (oscillators_.empty()) {
                     float sample = generateWaveform(voice.phase * uniDetuneMultiplier, waveform_);
                     float panL = std::cos((unisonPan + 1.0f) * 0.25f * 3.14159265f);
                     float panR = std::sin((unisonPan + 1.0f) * 0.25f * 3.14159265f);
                     sampleL += sample * panL * unisonScale;
                     sampleR += sample * panR * unisonScale;
-                } else {
-                    for (const auto& osc : oscillators_) {
+            } else {
+                for (const auto& osc : oscillators_) {
                         // Apply detune in cents (oscillator detune + unison detune)
                         float totalDetune = osc.detune + unisonDetune;
                         float detuneMultiplier = std::pow(2.0f, totalDetune / 1200.0f);
                         
                         // Calculate phase for this oscillator
                         float oscPhase = voice.phase * osc.frequencyMultiplier * detuneMultiplier;
-                        while (oscPhase >= 1.0f) oscPhase -= 1.0f;
-                        while (oscPhase < 0.0f) oscPhase += 1.0f;
-                        
+                    while (oscPhase >= 1.0f) oscPhase -= 1.0f;
+                    while (oscPhase < 0.0f) oscPhase += 1.0f;
+                    
                         float sample = generateWaveform(oscPhase, osc.waveform) * osc.amplitude;
                         
                         // Apply stereo panning (oscillator pan + unison pan)
