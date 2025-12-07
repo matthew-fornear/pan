@@ -138,6 +138,12 @@ MainWindow::MainWindow()
     , timelineScrollX_(0.0f)
     , isPlaying_(false)
     , lastTime_(0.0)
+    , loopEnabled_(true)
+    , loopStartBeat_(0.0f)
+    , loopLengthBeats_(16.0f)  // Default 4 bars (Ableton-style)
+    , timelineDivisionBeats_(4.0f) // default 1 bar (4 beats)
+    , clickWhilePlaying_(false)
+    , nextClickSample_(0)
     , isDraggingPlayhead_(false)
     , dragStartBeat_(0.0f)
     , playbackSamplePosition_(0)
@@ -692,7 +698,7 @@ bool MainWindow::initializeAudio() {
                     float* rightOut = trackBuffer.getNumChannels() > 1 ? trackBuffer.getWritePointer(1) : leftOut;
                     track.sampler->process(leftOut, rightOut, numFrames);
                 } else if (track.synth) {
-                    track.synth->generateAudio(trackBuffer, numFrames);
+                track.synth->generateAudio(trackBuffer, numFrames);
                 }
                 
                 // Apply effects chain
@@ -752,6 +758,42 @@ bool MainWindow::initializeAudio() {
         // Update playback position if playing
         if (isPlaying_) {
             playbackSamplePosition_ += numFrames;
+            if (loopEnabled_) {
+                double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                float beatsPerSecond = bpm_ / 60.0f;
+                float loopEndBeat = loopStartBeat_ + loopLengthBeats_;
+                float currentBeat = static_cast<float>(playbackSamplePosition_) / sampleRate * beatsPerSecond;
+                if (currentBeat >= loopEndBeat) {
+                    playbackSamplePosition_ = static_cast<int64_t>((loopStartBeat_ / beatsPerSecond) * sampleRate);
+                    nextClickSample_ = playbackSamplePosition_;
+                }
+            }
+        }
+        
+        // Metronome click while playing (not during count-in)
+        if (clickWhilePlaying_) {
+            double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+            double samplesPerBeat = (60.0 / bpm_) * sampleRate;
+            int64_t bufferStart = currentPlaybackPos;
+            int64_t bufferEnd = currentPlaybackPos + static_cast<int64_t>(numFrames);
+            while (nextClickSample_ <= bufferEnd) {
+                if (nextClickSample_ >= bufferStart) {
+                    size_t offset = static_cast<size_t>(nextClickSample_ - bufferStart);
+                    size_t clickLen = std::min<size_t>(static_cast<size_t>(sampleRate * 0.05), numFrames - offset); // 50ms
+                    float frequency = 800.0f;
+                    float amplitude = 0.2f;
+                    for (size_t i = 0; i < clickLen; ++i) {
+                        float t = static_cast<float>(i) / sampleRate;
+                        float envelope = 1.0f - (static_cast<float>(i) / clickLen);
+                        float sample = amplitude * envelope * std::sin(2.0f * static_cast<float>(M_PI) * frequency * t);
+                        output.getWritePointer(0)[offset + i] += sample;
+                        if (output.getNumChannels() > 1) {
+                            output.getWritePointer(1)[offset + i] += sample;
+                        }
+                    }
+                }
+                nextClickSample_ += static_cast<int64_t>(samplesPerBeat);
+            }
         }
         
         // Calculate master output levels for metering
@@ -835,10 +877,16 @@ bool MainWindow::initializeMIDI() {
                         // If master record is active and playing, record to timeline
                         if (masterRecord_ && isPlaying_) {
                             if (!track.recordingClip) {
-                                std::cout << "WARNING: Track " << trackIdx << " is recording but has no recordingClip!" << std::endl;
-                                // Create recording clip on the fly if missing
+                                double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                                float beatsPerSecond = bpm_ / 60.0f;
+                                float currentTimelinePos;
+                                {
+                                    std::lock_guard<std::mutex> lock(timelineMutex_);
+                                    currentTimelinePos = timelinePosition_;
+                                }
+                                int64_t clipStartSample = static_cast<int64_t>(currentTimelinePos / beatsPerSecond * sampleRate);
                                 track.recordingClip = std::make_shared<MidiClip>("Recording");
-                                track.recordingClip->setStartTime(0);
+                                track.recordingClip->setStartTime(clipStartSample);
                             }
                             
                             // Get timeline position thread-safely
@@ -852,8 +900,8 @@ bool MainWindow::initializeMIDI() {
                             // Timeline position is in beats, we need samples from clip start (0)
                             double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
                             float beatsPerSecond = bpm_ / 60.0f;
-                            // Convert beats to samples (currentTimelinePos is in beats, clip starts at 0)
-                            int64_t currentSample = static_cast<int64_t>(currentTimelinePos / beatsPerSecond * sampleRate);
+                            int64_t currentSampleAbs = static_cast<int64_t>(currentTimelinePos / beatsPerSecond * sampleRate);
+                            int64_t currentSample = currentSampleAbs - track.recordingClip->getStartTime();
                             
                             // Add event to recording clip (timestamp is relative to clip start)
                             track.recordingClip->addEvent(currentSample, msg);
@@ -1009,6 +1057,16 @@ void MainWindow::renderUI() {
     
     // Process any files dropped from OS
     processDroppedFiles();
+
+    // Auto-arm the selected track for recording and MIDI routing
+    if (!tracks_.empty()) {
+        if (selectedTrackIndex_ >= tracks_.size()) {
+            selectedTrackIndex_ = tracks_.size() - 1;
+        }
+        for (size_t i = 0; i < tracks_.size(); ++i) {
+            tracks_[i].isRecording = (i == selectedTrackIndex_);
+        }
+    }
     
     ImGuiViewport* viewport = ImGui::GetMainViewport();
     
@@ -1149,6 +1207,50 @@ void MainWindow::renderUI() {
     if (ImGui::IsKeyPressed(ImGuiKey_Space) && !ImGui::GetIO().WantTextInput) {
         isPlaying_ = !isPlaying_;
         isCountingIn_ = false;  // Cancel count-in if active
+    }
+    
+    // Handle F9: arm record + play
+    if (ImGui::IsKeyPressed(ImGuiKey_F9) && !ImGui::GetIO().WantTextInput) {
+        masterRecord_ = true;
+        // Start playback with record (respect count-in)
+        if (countInEnabled_) {
+            isCountingIn_ = true;
+            countInBeatsRemaining_ = 4;
+            countInLastBeatTime_ = 0.0;
+            isPlaying_ = false;
+            {
+                std::lock_guard<std::mutex> lock(timelineMutex_);
+                timelinePosition_ = loopEnabled_ ? loopStartBeat_ : 0.0f;
+            }
+            timelineScrollX_ = 0.0f;
+            double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+            float beatsPerSecond = bpm_ / 60.0f;
+            playbackSamplePosition_ = static_cast<int64_t>((loopEnabled_ ? loopStartBeat_ : 0.0f) / beatsPerSecond * sampleRate);
+            nextClickSample_ = playbackSamplePosition_;
+            for (auto& track : tracks_) {
+                if (track.isRecording) {
+                    track.recordingClip = std::make_shared<MidiClip>("Recording");
+                    track.recordingClip->setStartTime(playbackSamplePosition_);
+                }
+            }
+        } else {
+            isPlaying_ = true;
+            {
+                std::lock_guard<std::mutex> lock(timelineMutex_);
+                timelinePosition_ = loopEnabled_ ? loopStartBeat_ : 0.0f;
+            }
+            timelineScrollX_ = 0.0f;
+            double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+            float beatsPerSecond = bpm_ / 60.0f;
+            playbackSamplePosition_ = static_cast<int64_t>((loopEnabled_ ? loopStartBeat_ : 0.0f) / beatsPerSecond * sampleRate);
+            nextClickSample_ = playbackSamplePosition_;
+            for (auto& track : tracks_) {
+                if (track.isRecording) {
+                    track.recordingClip = std::make_shared<MidiClip>("Recording");
+                    track.recordingClip->setStartTime(playbackSamplePosition_);
+                }
+            }
+        }
     }
     
     ImGui::End(); // DockSpace
@@ -1417,6 +1519,8 @@ void MainWindow::renderSampleLibrary(ImGuiID target_dock_id) {
                     for (auto& pad : track.drumKit->pads) {
                         pad.sampler = std::make_shared<Sampler>(sampleRate);
                     }
+                    // Populate kit with samples if available
+                    loadDrumKitPreset(*track.drumKit, kitPresets[i]);
                     markDirty();
                 }
             }
@@ -2980,7 +3084,7 @@ void MainWindow::renderDrumRackPanel(size_t trackIndex) {
     auto& kit = *track.drumKit;
     
     // Panel dimensions - Ableton-like compact layout
-    float panelWidth = ImGui::GetContentRegionAvail().x;
+    float panelWidth = ImGui::GetContentRegionAvail().x / 3.0f;  // match sampler width
     float panelHeight = 260.0f;
     
     ImVec2 startPos = ImGui::GetCursorScreenPos();
@@ -3000,6 +3104,27 @@ void MainWindow::renderDrumRackPanel(size_t trackIndex) {
                            bgColor, 4.0f);
     drawList->AddRect(startPos, ImVec2(startPos.x + panelWidth, startPos.y + panelHeight),
                      borderColor, 4.0f);
+    
+    // Allow dropping kit presets onto the panel to populate it
+    ImGui::SetCursorScreenPos(startPos);
+    ImGui::InvisibleButton("##drumRackDrop", ImVec2(panelWidth, panelHeight));
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("DRUMKIT_PRESET")) {
+            const char* kitNames[] = { "808 Kit", "909 Kit", "Acoustic Kit", "Lo-Fi Kit" };
+            int presetIdx = *(int*)payload->Data;
+            kit.name = kitNames[presetIdx];
+            // Ensure samplers exist
+            double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+            for (auto& pad : kit.pads) {
+                if (!pad.sampler) pad.sampler = std::make_shared<Sampler>(sampleRate);
+            }
+            loadDrumKitPreset(kit, kitNames[presetIdx]);
+            markDirty();
+        }
+        ImGui::EndDragDropTarget();
+    }
+    // Reset cursor for subsequent elements
+    ImGui::SetCursorScreenPos(ImVec2(startPos.x, startPos.y));
     
     // Header bar
     float headerH = 22.0f;
@@ -4680,6 +4805,7 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
                 for (auto& pad : tracks_[i].drumKit->pads) {
                     pad.sampler = std::make_shared<Sampler>(sampleRate);
                 }
+                loadDrumKitPreset(*tracks_[i].drumKit, kitNames[presetIdx]);
                 selectedTrackIndex_ = i;
                 markDirty();
             }
@@ -4839,6 +4965,7 @@ void MainWindow::renderTracks(ImGuiID target_dock_id) {
             for (auto& pad : newTrack.drumKit->pads) {
                 pad.sampler = std::make_shared<Sampler>(engine_->getSampleRate());
             }
+            loadDrumKitPreset(*newTrack.drumKit, kitNames[presetIdx]);
             tracks_.push_back(std::move(newTrack));
             selectedTrackIndex_ = tracks_.size() - 1;
             markDirty();
@@ -5637,7 +5764,7 @@ void MainWindow::renderTransportControls() {
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.2f, 0.2f, 0.5f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.3f, 0.3f, 0.3f, 0.5f));
     
-    if (ImGui::Button("##play", ImVec2(40, 40))) {
+            if (ImGui::Button("##play", ImVec2(40, 40))) {
         // Check if count-in is enabled and we're recording
         if (countInEnabled_ && masterRecord_) {
             // Start count-in
@@ -5649,10 +5776,11 @@ void MainWindow::renderTransportControls() {
             // Reset timeline position
             {
                 std::lock_guard<std::mutex> lock(timelineMutex_);
-                timelinePosition_ = 0.0f;
+                        timelinePosition_ = loopEnabled_ ? loopStartBeat_ : 0.0f;
             }
             timelineScrollX_ = 0.0f;
-            playbackSamplePosition_ = 0;
+                    playbackSamplePosition_ = static_cast<int64_t>((loopEnabled_ ? loopStartBeat_ : 0.0f) / (bpm_ / 60.0f) * (engine_ ? engine_->getSampleRate() : 44100.0));
+                    nextClickSample_ = playbackSamplePosition_;
             
             // Create recording clips for all hot tracks
             for (auto& track : tracks_) {
@@ -5673,7 +5801,8 @@ void MainWindow::renderTransportControls() {
                 std::lock_guard<std::mutex> lock(timelineMutex_);
                 currentTimelinePos = timelinePosition_;
             }
-            playbackSamplePosition_ = static_cast<int64_t>(currentTimelinePos / beatsPerSecond * sampleRate);
+                    playbackSamplePosition_ = static_cast<int64_t>(currentTimelinePos / beatsPerSecond * sampleRate);
+                    nextClickSample_ = playbackSamplePosition_;
             
         if (masterRecord_) {
             // Start recording - reset timeline position when play starts
@@ -5842,6 +5971,20 @@ void MainWindow::renderTransportControls() {
         markDirty();
     }
     
+    // Click (metronome) checkbox to the right of Count-In
+    ImGui::SameLine();
+    bool clickChanged = ImGui::Checkbox("Click", &clickWhilePlaying_);
+    if (clickChanged) {
+        markDirty();
+    }
+    
+    // Loop toggle in master GUI (stacked below count-in)
+    ImGui::SetCursorPos(ImVec2(countInPos.x, countInPos.y + ImGui::GetTextLineHeightWithSpacing()));
+    bool loopChanged = ImGui::Checkbox("Loop", &loopEnabled_);
+    if (loopChanged) {
+        markDirty();
+    }
+    
     // Show indicator when counting in
     if (isCountingIn_) {
         ImGui::SameLine();
@@ -5950,6 +6093,14 @@ void MainWindow::updateTimeline() {
             {
                 std::lock_guard<std::mutex> lock(timelineMutex_);
                 timelinePosition_ += static_cast<float>(deltaTime * beatsPerSecond);
+                if (loopEnabled_) {
+                    float loopEnd = loopStartBeat_ + loopLengthBeats_;
+                    if (timelinePosition_ >= loopEnd) {
+                        timelinePosition_ = loopStartBeat_;
+                        double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                        playbackSamplePosition_ = static_cast<int64_t>((loopStartBeat_ / beatsPerSecond) * sampleRate);
+                    }
+                }
             }
             
             // Check if playhead has reached right edge and scroll
@@ -5978,9 +6129,11 @@ void MainWindow::updateTimeline() {
 
 void MainWindow::renderTrackTimeline(size_t trackIndex) {
 #ifdef PAN_USE_GUI
-    const float pixelsPerBeat = 50.0f;
-    const float timelineHeight = 60.0f;  // Match track header height
-    const float beatMarkerHeight = 16.0f;
+    const float pixelsPerBeatBase = 50.0f;
+    float zoomScale = std::clamp(4.0f / std::max(0.25f, timelineDivisionBeats_), 0.5f, 16.0f);
+    float pixelsPerBeat = pixelsPerBeatBase * zoomScale;
+    const float timelineHeight = 70.0f;  // More vertical room for handles/cursor
+    const float beatMarkerHeight = 22.0f;
     
     // Track color palette (24 colors, same as renderTracks)
     static const ImU32 trackColors[24] = {
@@ -6004,6 +6157,46 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
     canvasSize.x = std::max(canvasSize.x, 600.0f);
     canvasSize.y = timelineHeight;
     
+    // Horizontal timeline scroll bar (controls all tracks) - only draw once above Track 1
+    if (trackIndex == 0) {
+        float barHeight = 18.0f;
+        // Compute max content length in beats (clips/loop)
+        float maxBeat = loopStartBeat_ + loopLengthBeats_;
+        double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+        float beatsPerSecond = bpm_ / 60.0f;
+        float samplesPerBeat = sampleRate / beatsPerSecond;
+        for (const auto& t : tracks_) {
+            for (const auto& clip : t.clips) {
+                if (!clip) continue;
+                const auto& ev = clip->getEvents();
+                if (ev.empty()) continue;
+                int64_t lastTs = ev.back().timestamp;
+                float clipStartBeat = static_cast<float>(clip->getStartTime()) / samplesPerBeat;
+                float clipEndBeat = clipStartBeat + static_cast<float>(lastTs) / samplesPerBeat;
+                maxBeat = std::max(maxBeat, clipEndBeat + 4.0f);
+            }
+        }
+        // At least 16 bars visible
+        maxBeat = std::max(maxBeat, 64.0f);
+        float visibleBeats = canvasSize.x / pixelsPerBeat;
+        float maxScroll = std::max(0.0f, (maxBeat - visibleBeats) * pixelsPerBeat);
+        
+        ImGui::PushID("timeline_scrollbar");
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 2.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2, 2));
+        float scrollVal = timelineScrollX_;
+        ImGui::SetCursorScreenPos(canvasPos);
+        ImGui::SetNextItemWidth(canvasSize.x);
+        if (ImGui::SliderFloat("##timeline_scroll", &scrollVal, 0.0f, maxScroll, "")) {
+            timelineScrollX_ = scrollVal;
+        }
+        ImGui::PopStyleVar(2);
+        ImGui::PopID();
+        
+        canvasPos.y += barHeight + 4.0f; // extra padding below scrollbar
+        canvasSize.y -= (barHeight + 4.0f);
+    }
+    
     int trackColorIdx = tracks_[trackIndex].colorIndex % 24;
     
     // Dark timeline background
@@ -6014,25 +6207,30 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
     drawList->AddRectFilled(canvasPos, ImVec2(canvasPos.x + canvasSize.x, canvasPos.y + beatMarkerHeight),
                            IM_COL32(30, 30, 30, 255));
     
-    // Draw beat markers
+    // Draw beat markers with configurable division
+    float gridStep = std::max(0.0625f, timelineDivisionBeats_);
     float visibleBeats = canvasSize.x / pixelsPerBeat;
     float startBeat = std::floor(timelineScrollX_ / pixelsPerBeat);
-    float endBeat = startBeat + visibleBeats + 1.0f;
+    float endBeat = startBeat + visibleBeats + gridStep;
     
-    for (float beat = startBeat; beat <= endBeat; beat += 1.0f) {
+    for (float beat = startBeat; beat <= endBeat; beat += gridStep) {
         float x = canvasPos.x + (beat * pixelsPerBeat) - timelineScrollX_;
         if (x >= canvasPos.x && x <= canvasPos.x + canvasSize.x) {
-            bool isBar = (static_cast<int>(beat) % 4 == 0);
+            int beatInt = static_cast<int>(std::round(beat));
+            bool isBar = (beatInt % 4 == 0);
+            bool isMajor = (beatInt % 1 == 0); // every beat
             
-            // Vertical line
-            ImU32 lineColor = isBar ? IM_COL32(70, 70, 70, 255) : IM_COL32(45, 45, 45, 255);
+            ImU32 lineColor = isBar ? IM_COL32(70, 70, 70, 255)
+                                    : (isMajor ? IM_COL32(55, 55, 55, 255) : IM_COL32(45, 45, 45, 255));
             drawList->AddLine(ImVec2(x, canvasPos.y + beatMarkerHeight),
                              ImVec2(x, canvasPos.y + canvasSize.y), lineColor);
             
-            // Beat/bar number
-            if (isBar) {
+            // Bar/beat labels in music-theory style: Bar.Beat
+            if (isMajor) {
+                int barNum = beatInt / 4 + 1;
+                int beatInBar = (beatInt % 4) + 1;
                 char beatLabel[16];
-                snprintf(beatLabel, sizeof(beatLabel), "%d", static_cast<int>(beat / 4.0f) + 1);
+                snprintf(beatLabel, sizeof(beatLabel), "%d.%d", barNum, beatInBar);
                 drawList->AddText(ImVec2(x + 3, canvasPos.y + 2), IM_COL32(100, 100, 100, 255), beatLabel);
             }
         }
@@ -6190,6 +6388,79 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
         }
     }
     
+    // Loop region (master) - draw once per track for consistency
+    if (loopEnabled_) {
+        float loopStart, loopLen;
+        {
+            std::lock_guard<std::mutex> lock(timelineMutex_);
+            loopStart = loopStartBeat_;
+            loopLen = loopLengthBeats_;
+        }
+        float loopEnd = loopStart + loopLen;
+        float loopStartX = canvasPos.x + (loopStart * pixelsPerBeat) - timelineScrollX_;
+        float loopEndX = canvasPos.x + (loopEnd * pixelsPerBeat) - timelineScrollX_;
+        // Loop color: warm, lighter orange to match palette but distinct from playhead
+        ImU32 loopFill = IM_COL32(255, 180, 90, 40);
+        ImU32 loopBorder = IM_COL32(255, 200, 120, 200);
+        
+        // Filled band
+        drawList->AddRectFilled(
+            ImVec2(loopStartX, canvasPos.y + beatMarkerHeight),
+            ImVec2(loopEndX, canvasPos.y + canvasSize.y),
+            loopFill);
+        // Borders
+        drawList->AddLine(ImVec2(loopStartX, canvasPos.y + beatMarkerHeight),
+                          ImVec2(loopStartX, canvasPos.y + canvasSize.y),
+                          loopBorder, 2.0f);
+        drawList->AddLine(ImVec2(loopEndX, canvasPos.y + beatMarkerHeight),
+                          ImVec2(loopEndX, canvasPos.y + canvasSize.y),
+                          loopBorder, 2.0f);
+        // Handle triangles
+        // Downward-pointing handles
+        float handleW = 20.0f;
+        float handleH = 16.0f;
+        drawList->AddTriangleFilled(ImVec2(loopStartX, canvasPos.y + beatMarkerHeight + handleH),
+                                    ImVec2(loopStartX + handleW * 0.5f, canvasPos.y + beatMarkerHeight),
+                                    ImVec2(loopStartX - handleW * 0.5f, canvasPos.y + beatMarkerHeight),
+                                    loopBorder);
+        drawList->AddTriangleFilled(ImVec2(loopEndX, canvasPos.y + beatMarkerHeight + handleH),
+                                    ImVec2(loopEndX + handleW * 0.5f, canvasPos.y + beatMarkerHeight),
+                                    ImVec2(loopEndX - handleW * 0.5f, canvasPos.y + beatMarkerHeight),
+                                    loopBorder);
+        
+        // Interaction handles
+        // Restrict hitbox to below the numeration bar so ruler drags the playhead
+        float handleYOffset = beatMarkerHeight + 4.0f;
+        float handleHeight = handleH + 12.0f;
+        ImGui::SetCursorScreenPos(ImVec2(loopStartX - 13, canvasPos.y + handleYOffset));
+        ImGui::InvisibleButton("##loop_start_handle", ImVec2(26, handleHeight));
+        bool dragStart = ImGui::IsItemActive() && ImGui::IsMouseDragging(0);
+        ImGui::SetCursorScreenPos(ImVec2(loopEndX - 13, canvasPos.y + handleYOffset));
+        ImGui::InvisibleButton("##loop_end_handle", ImVec2(26, handleHeight));
+        bool dragEnd = ImGui::IsItemActive() && ImGui::IsMouseDragging(0);
+        
+        float minLen = 1.0f; // at least 1 beat
+        if (dragStart || dragEnd) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            float mouseBeat = (ImGui::GetMousePos().x - canvasPos.x + timelineScrollX_) / pixelsPerBeat;
+            mouseBeat = std::max(0.0f, mouseBeat);
+            // Snap to timeline division
+            float grid = std::max(0.0625f, timelineDivisionBeats_);
+            mouseBeat = std::round(mouseBeat / grid) * grid;
+            std::lock_guard<std::mutex> lock(timelineMutex_);
+            if (dragStart) {
+                float loopEndBeat = loopStartBeat_ + loopLengthBeats_;
+                float newStart = std::min(mouseBeat, loopEndBeat - minLen);
+                loopStartBeat_ = newStart;
+                loopLengthBeats_ = std::max(minLen, loopEndBeat - newStart);
+            } else if (dragEnd) {
+                float newLen = std::max(minLen, mouseBeat - loopStartBeat_);
+                loopLengthBeats_ = newLen;
+            }
+            markDirty();
+        }
+    }
+    
     // Draw playhead (vertical line with triangle head) - Ableton style
     float currentTimelinePos;
     {
@@ -6230,8 +6501,8 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
         ImVec2 mousePos = ImGui::GetMousePos();
         
         // Check if near the playhead or on the ruler area (top 20 pixels)
-        bool nearPlayhead = std::abs(mousePos.x - playheadX) < 10.0f;
-        bool onRuler = (mousePos.y - canvasPos.y) < 20.0f;
+        bool nearPlayhead = std::abs(mousePos.x - playheadX) < 14.0f;
+        bool onRuler = (mousePos.y - canvasPos.y) < 28.0f;
         
         if (nearPlayhead || onRuler) {
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
@@ -6246,6 +6517,9 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
         if (timelineDragging) {
             float newBeat = (mousePos.x - canvasPos.x + timelineScrollX_) / pixelsPerBeat;
             newBeat = std::max(0.0f, newBeat);
+            // Snap playhead to division
+            float grid = std::max(0.0625f, timelineDivisionBeats_);
+            newBeat = std::round(newBeat / grid) * grid;
             
             {
                 std::lock_guard<std::mutex> lock(timelineMutex_);
@@ -6261,6 +6535,30 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
                 timelineDragging = false;
             }
         }
+    }
+
+    // Right-click context menu for timeline division
+    if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(1)) {
+        ImGui::OpenPopup("timeline_division_menu");
+    }
+    if (ImGui::BeginPopup("timeline_division_menu")) {
+        const struct { const char* label; float beats; } divisions[] = {
+            { "1 Bar (4 beats)", 4.0f },
+            { "1/2 Bar (2 beats)", 2.0f },
+            { "1 Beat", 1.0f },
+            { "1/2 Beat", 0.5f },
+            { "1/4 Beat", 0.25f },
+            { "1/8 Beat", 0.125f },
+            { "1/16 Beat", 0.0625f },
+        };
+        for (const auto& d : divisions) {
+            bool sel = std::abs(timelineDivisionBeats_ - d.beats) < 1e-4f;
+            if (ImGui::MenuItem(d.label, nullptr, sel)) {
+                timelineDivisionBeats_ = d.beats;
+                markDirty();
+            }
+        }
+        ImGui::EndPopup();
     }
     
     // Handle horizontal scrolling with mouse wheel (only on first track to avoid conflicts)
@@ -6297,6 +6595,9 @@ void MainWindow::newProject() {
     timelinePosition_ = 0.0f;
     timelineScrollX_ = 0.0f;
     isPlaying_ = false;
+    loopEnabled_ = true;
+    loopStartBeat_ = 0.0f;
+    loopLengthBeats_ = 16.0f;
     masterRecord_ = false;
     currentProjectPath_ = "";
     hasUnsavedChanges_ = false;
@@ -8598,7 +8899,7 @@ void MainWindow::initializeInstrumentPresets() {
         envGlitch.saturation.mix = 0.6f;
         instrumentPresets_.push_back(InstrumentPreset(
             "Glitch Bass",
-            "FlyLo",
+            "Bass",
             {
                 Oscillator(Waveform::Square, 0.5f, 0.7f),
                 Oscillator(Waveform::Sawtooth, 0.502f, 0.5f),  // Slight detune for instability
@@ -8619,7 +8920,7 @@ void MainWindow::initializeInstrumentPresets() {
         envWarped.filter.resonance = 0.15f;
         instrumentPresets_.push_back(InstrumentPreset(
             "Warped Rhodes",
-            "FlyLo",
+            "Keys",
             {
                 Oscillator(Waveform::Sine, 1.0f, 0.55f),
                 Oscillator(Waveform::Sine, 2.0f, 0.25f),
@@ -8641,7 +8942,7 @@ void MainWindow::initializeInstrumentPresets() {
         envIDM.filter.resonance = 0.35f;
         instrumentPresets_.push_back(InstrumentPreset(
             "IDM Lead",
-            "Aphex",
+            "Lead",
             {
                 Oscillator(Waveform::Sawtooth, 1.0f, 0.45f),
                 Oscillator(Waveform::Sawtooth, 1.007f, 0.35f),
@@ -8663,7 +8964,7 @@ void MainWindow::initializeInstrumentPresets() {
         envStab.filter.resonance = 0.5f;
         instrumentPresets_.push_back(InstrumentPreset(
             "Braindance Stab",
-            "Aphex",
+            "Lead",
             {
                 Oscillator(Waveform::Square, 1.0f, 0.5f),
                 Oscillator(Waveform::Sawtooth, 1.5f, 0.4f),
@@ -8689,7 +8990,7 @@ void MainWindow::initializeInstrumentPresets() {
         envHaze.unison.spread = 0.9f;
         instrumentPresets_.push_back(InstrumentPreset(
             "Ethereal Haze",
-            "FlyLo",
+            "Pad",
             {
                 Oscillator(Waveform::Sine, 1.0f, 0.4f),
                 Oscillator(Waveform::Triangle, 2.0f, 0.25f),
@@ -8708,7 +9009,7 @@ void MainWindow::initializeInstrumentPresets() {
         envGranular.lfo2 = LFO(0.23f, 0.35f, LFO::Target::Amplitude);
         instrumentPresets_.push_back(InstrumentPreset(
             "Granular Texture",
-            "FlyLo",
+            "Atmosphere",
             {
                 Oscillator(Waveform::Triangle, 1.0f, 0.3f, -25.0f),
                 Oscillator(Waveform::Triangle, 1.0f, 0.3f, +25.0f),
@@ -8733,7 +9034,7 @@ void MainWindow::initializeInstrumentPresets() {
         envDrill.saturation.mix = 0.4f;
         instrumentPresets_.push_back(InstrumentPreset(
             "Drill n Bass",
-            "Aphex",
+            "Bass",
             {
                 Oscillator(Waveform::Sawtooth, 0.5f, 0.6f),
                 Oscillator(Waveform::Square, 0.5f, 0.4f),
@@ -8753,7 +9054,7 @@ void MainWindow::initializeInstrumentPresets() {
         envMelancholy.filter.cutoff = 0.45f;
         instrumentPresets_.push_back(InstrumentPreset(
             "Melancholic Keys",
-            "FlyLo",
+            "Keys",
             {
                 Oscillator(Waveform::Triangle, 1.0f, 0.5f),
                 Oscillator(Waveform::Triangle, 0.998f, 0.3f),  // Chorusing
@@ -8776,7 +9077,7 @@ void MainWindow::initializeInstrumentPresets() {
         envAcidSaw.portamento.time = 0.05f;
         instrumentPresets_.push_back(InstrumentPreset(
             "Acid Saw",
-            "Aphex",
+            "Lead",
             {
                 Oscillator(Waveform::Sawtooth, 1.0f, 0.7f),
                 Oscillator(Waveform::Sawtooth, 0.5f, 0.3f)
@@ -8795,7 +9096,7 @@ void MainWindow::initializeInstrumentPresets() {
         envDrone.filter.cutoff = 0.3f;
         instrumentPresets_.push_back(InstrumentPreset(
             "Ambient Drone",
-            "FlyLo",
+            "Atmosphere",
             {
                 Oscillator(Waveform::Sine, 1.0f, 0.4f, -10.0f),
                 Oscillator(Waveform::Sine, 1.0f, 0.4f, +10.0f),
@@ -8820,7 +9121,7 @@ void MainWindow::initializeInstrumentPresets() {
         envBroken.saturation.mix = 0.5f;
         instrumentPresets_.push_back(InstrumentPreset(
             "Broken Transmission",
-            "Aphex",
+            "Synth",
             {
                 Oscillator(Waveform::Square, 1.0f, 0.4f),
                 Oscillator(Waveform::Square, 1.03f, 0.35f),
@@ -8843,7 +9144,7 @@ void MainWindow::initializeInstrumentPresets() {
         envTape.saturation.mix = 0.35f;
         instrumentPresets_.push_back(InstrumentPreset(
             "Tape Saturation Pad",
-            "FlyLo",
+            "Pad",
             {
                 Oscillator(Waveform::Triangle, 1.0f, 0.45f, -8.0f),
                 Oscillator(Waveform::Triangle, 1.0f, 0.45f, +8.0f),
@@ -8855,6 +9156,152 @@ void MainWindow::initializeInstrumentPresets() {
     }
     
     std::cout << "Initialized " << instrumentPresets_.size() << " instrument presets" << std::endl;
+}
+
+// Helpers for auto-generating tiny drum samples if kits are missing on disk
+namespace {
+bool writeWavMono16(const std::string& path, const std::vector<float>& data, int sampleRate) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out.is_open()) return false;
+    uint32_t dataSize = static_cast<uint32_t>(data.size() * 2);
+    uint32_t fmtChunkSize = 16;
+    uint16_t audioFormat = 1; // PCM
+    uint16_t numChannels = 1;
+    uint32_t byteRate = sampleRate * numChannels * 2;
+    uint16_t blockAlign = numChannels * 2;
+    uint16_t bitsPerSample = 16;
+    uint32_t chunkSize = 4 + (8 + fmtChunkSize) + (8 + dataSize);
+    out.write("RIFF", 4);
+    out.write(reinterpret_cast<char*>(&chunkSize), 4);
+    out.write("WAVE", 4);
+    out.write("fmt ", 4);
+    out.write(reinterpret_cast<char*>(&fmtChunkSize), 4);
+    out.write(reinterpret_cast<char*>(&audioFormat), 2);
+    out.write(reinterpret_cast<char*>(&numChannels), 2);
+    out.write(reinterpret_cast<char*>(&sampleRate), 4);
+    out.write(reinterpret_cast<char*>(&byteRate), 4);
+    out.write(reinterpret_cast<char*>(&blockAlign), 2);
+    out.write(reinterpret_cast<char*>(&bitsPerSample), 2);
+    out.write("data", 4);
+    out.write(reinterpret_cast<char*>(&dataSize), 4);
+    for (float f : data) {
+        int16_t s = static_cast<int16_t>(std::clamp(f, -1.0f, 1.0f) * 32767.0f);
+        out.write(reinterpret_cast<char*>(&s), 2);
+    }
+    return true;
+}
+
+std::vector<float> synthDrum(const std::string& name, int sampleRate) {
+    int total = static_cast<int>(0.5f * sampleRate);
+    std::vector<float> d(total, 0.0f);
+    std::default_random_engine rng(42);
+    std::uniform_real_distribution<float> noise(-1.0f, 1.0f);
+    
+    auto env = [&](int i, float decay) {
+        float t = static_cast<float>(i) / sampleRate;
+        return std::exp(-t * decay);
+    };
+    
+    if (name.find("kick") != std::string::npos) {
+        for (int i = 0; i < total; ++i) {
+            float t = static_cast<float>(i) / sampleRate;
+            float freq = 80.0f + 80.0f * std::exp(-t * 12.0f);
+            float phase = 2.0f * 3.14159265f * freq * t;
+            d[i] = std::sin(phase) * env(i, 10.0f);
+        }
+    } else if (name.find("snare") != std::string::npos || name.find("clap") != std::string::npos) {
+        for (int i = 0; i < total; ++i) d[i] = noise(rng) * env(i, 18.0f);
+    } else if (name.find("hat") != std::string::npos || name.find("ch") != std::string::npos || name.find("oh") != std::string::npos) {
+        for (int i = 0; i < total; ++i) d[i] = noise(rng) * env(i, 35.0f);
+    } else if (name.find("tom") != std::string::npos) {
+        float base = name.find("low") != std::string::npos ? 110.0f : (name.find("mid") != std::string::npos ? 160.0f : 210.0f);
+        for (int i = 0; i < total; ++i) {
+            float t = static_cast<float>(i) / sampleRate;
+            float phase = 2.0f * 3.14159265f * base * t;
+            d[i] = std::sin(phase) * env(i, 12.0f);
+        }
+    } else {
+        for (int i = 0; i < total; ++i) d[i] = noise(rng) * env(i, 20.0f);
+    }
+    return d;
+}
+} // namespace
+
+// Load drum kit preset samples into pads; auto-generate if missing
+bool MainWindow::loadDrumKitPreset(DrumKit& kit, const std::string& presetName) {
+#ifdef PAN_USE_GUI
+    namespace fs = std::filesystem;
+    struct PadFile { int pad; const char* filename; };
+    
+    std::string basePath;
+    std::vector<PadFile> files;
+    
+    if (presetName == "808 Kit") {
+        basePath = "samples/kits/808/";
+        files = {
+            {0, "kick.wav"}, {1, "snare.wav"}, {2, "clap.wav"}, {3, "rim.wav"},
+            {4, "ch.wav"}, {5, "oh.wav"}, {6, "cowbell.wav"}, {7, "tom_low.wav"},
+            {8, "tom_mid.wav"}, {9, "tom_high.wav"}, {10, "conga.wav"}, {11, "maraca.wav"},
+            {12, "crash.wav"}, {13, "ride.wav"}, {14, "shaker.wav"}, {15, "fx.wav"}
+        };
+    } else if (presetName == "909 Kit") {
+        basePath = "samples/kits/909/";
+        files = {
+            {0, "kick.wav"}, {1, "snare.wav"}, {2, "clap.wav"}, {3, "rim.wav"},
+            {4, "ch.wav"}, {5, "oh.wav"}, {6, "tom_low.wav"}, {7, "tom_mid.wav"},
+            {8, "tom_high.wav"}, {9, "crash.wav"}, {10, "ride.wav"}, {11, "perc1.wav"},
+            {12, "perc2.wav"}, {13, "shaker.wav"}, {14, "cowbell.wav"}, {15, "fx.wav"}
+        };
+    } else if (presetName == "Acoustic Kit") {
+        basePath = "samples/kits/acoustic/";
+        files = {
+            {0, "kick.wav"}, {1, "snare.wav"}, {2, "hat_closed.wav"}, {3, "hat_open.wav"},
+            {4, "tom_low.wav"}, {5, "tom_mid.wav"}, {6, "tom_high.wav"}, {7, "rim.wav"},
+            {8, "ride.wav"}, {9, "crash.wav"}, {10, "clap.wav"}, {11, "shaker.wav"},
+            {12, "perc1.wav"}, {13, "perc2.wav"}, {14, "fx1.wav"}, {15, "fx2.wav"}
+        };
+    } else if (presetName == "Lo-Fi Kit") {
+        basePath = "samples/kits/lofi/";
+        files = {
+            {0, "kick.wav"}, {1, "snare.wav"}, {2, "ch.wav"}, {3, "oh.wav"},
+            {4, "clap.wav"}, {5, "rim.wav"}, {6, "perc1.wav"}, {7, "perc2.wav"},
+            {8, "tom_low.wav"}, {9, "tom_mid.wav"}, {10, "tom_high.wav"}, {11, "hat_tape.wav"},
+            {12, "vinyl1.wav"}, {13, "vinyl2.wav"}, {14, "fx1.wav"}, {15, "fx2.wav"}
+        };
+    } else {
+        return false;
+    }
+    
+    double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+    bool loadedAny = false;
+    
+    // Ensure kit directory exists
+    fs::create_directories(basePath);
+    
+    for (const auto& pf : files) {
+        if (pf.pad < 0 || pf.pad >= static_cast<int>(kit.pads.size())) continue;
+        std::string path = basePath + pf.filename;
+        if (!fs::exists(path)) {
+            // Auto-generate a tiny percussion sample so the pad is populated
+            auto data = synthDrum(pf.filename, static_cast<int>(sampleRate));
+            writeWavMono16(path, data, static_cast<int>(sampleRate));
+        }
+        if (!fs::exists(path)) continue;
+        auto& pad = kit.pads[pf.pad];
+        if (!pad.sampler) pad.sampler = std::make_shared<Sampler>(sampleRate);
+        pad.samplePath = path;
+        pad.sampleName = fs::path(path).filename().string();
+        pad.waveform.clear();  // waveform display optional
+        pad.sampler->loadSample(path);
+        loadedAny = true;
+    }
+    
+    kit.selectedPad = 0;
+    return loadedAny;
+#else
+    (void)kit; (void)presetName;
+    return false;
+#endif
 }
 
 void MainWindow::saveUserPreset(const std::string& name, const std::vector<Oscillator>& oscillators) {

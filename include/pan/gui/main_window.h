@@ -178,6 +178,7 @@ private:
     void saveUserPreset(const std::string& name, const std::vector<Oscillator>& oscillators);
     void loadUserPresets();  // Load user presets from file
     void saveUserPresetsToFile();  // Save user presets to file
+    bool loadDrumKitPreset(DrumKit& kit, const std::string& presetName);  // Load kit samples into pads
     
     // Sample library
     std::vector<SampleInfo> userSamples_;  // User-loaded samples
@@ -212,6 +213,13 @@ private:
     float timelineScrollX_;  // Horizontal scroll offset for timeline
     bool isPlaying_;  // Transport play state
     double lastTime_;  // Last update time for timeline
+    // Looping
+    bool loopEnabled_;          // Loop playback
+    float loopStartBeat_;       // Loop start (beats)
+    float loopLengthBeats_;     // Loop length (beats)
+    float timelineDivisionBeats_; // Grid step for timeline (in beats)
+    bool clickWhilePlaying_;    // Metronome during playback
+    int64_t nextClickSample_;   // Next click sample position
     std::mutex timelineMutex_;  // Thread safety for timeline position (accessed from MIDI callback)
     bool isDraggingPlayhead_;  // Whether user is dragging the playhead
     float dragStartBeat_;  // Beat position when drag started
