@@ -2,8 +2,6 @@
 
 Pan is a modern, open-source Digital Audio Workstation (DAW) designed for music production, audio editing, and sound design.
 
-GitHub: https://github.com/matthew-fornear/pan
-
 ## Overview
 
 Pan provides a comprehensive platform for creating, editing, and mixing audio projects with a full-featured graphical interface. Whether you're a professional producer or an aspiring musician, Pan offers the tools you need to bring your musical ideas to life.
