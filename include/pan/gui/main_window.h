@@ -220,10 +220,22 @@ private:
     float timelineDivisionBeats_; // Grid step for timeline (in beats)
     bool clickWhilePlaying_;    // Metronome during playback
     int64_t nextClickSample_;   // Next click sample position
+    // Clip selection and clipboard
+    size_t selectedClipTrack_ = static_cast<size_t>(-1);
+    size_t selectedClipIndex_ = static_cast<size_t>(-1);
+    std::shared_ptr<MidiClip> clipboardClip_;
+    // Simple one-level undo for last recorded clip
+    size_t lastRecordedTrack_ = static_cast<size_t>(-1);
+    size_t lastRecordedClip_ = static_cast<size_t>(-1);
+    // Clip snapping (independent of timeline division)
+    bool clipSnapEnabled_ = true;
+    float clipSnapBeats_ = 1.0f; // default 1 beat
     std::mutex timelineMutex_;  // Thread safety for timeline position (accessed from MIDI callback)
     bool isDraggingPlayhead_;  // Whether user is dragging the playhead
     float dragStartBeat_;  // Beat position when drag started
     int64_t playbackSamplePosition_;  // Current playback position in samples (for MIDI clip playback)
+    int64_t recordingSampleOffset_;   // Accumulates loop spans during recording to keep timestamps monotonic
+    int64_t lastRecordPlaybackPos_;   // Last playback position seen while recording (for wrap detection)
     
     void processDroppedFiles();  // Process files dropped from OS
     

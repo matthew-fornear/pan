@@ -2,12 +2,6 @@
 
 Pan is a modern Digital Audio Workstation (DAW) designed for music production, audio editing, and sound design.
 
-GitHub: https://github.com/matthew-fornear/pan
-
-## Overview
-
-Pan provides a comprehensive platform for creating, editing, and mixing audio projects with a full-featured graphical interface. Whether you're a professional producer or an aspiring musician, Pan offers the tools you need to bring your musical ideas to life.
-
 ## Features
 
 ### Core Functionality
@@ -269,28 +263,12 @@ Then restart your audio session or reboot.
 - [ ] Plugin support (VST, AU, LV2)
 - [ ] Audio export functionality
 
-## Contributing
-
-This is a proprietary project. Unauthorized copying, modification, distribution, or use of this software, via any medium, is strictly prohibited without explicit written permission from the copyright owner.
-
 ## License
 
 Copyright (c) 2024 Matthew Fornear. All Rights Reserved.
 
 This software and associated documentation files (the "Software") are the proprietary and confidential property of Matthew Fornear. 
 
-**Unauthorized use, copying, modification, distribution, or reproduction of this Software, in whole or in part, is strictly prohibited and may result in severe civil and criminal penalties.**
-
-The Software is protected by copyright laws and international copyright treaties, as well as other intellectual property laws and treaties. Any unauthorized use of the Software may violate copyright, trademark, and other laws.
-
-**Terms:**
-- You may NOT fork, clone, copy, or reproduce this repository without explicit written permission
-- You may NOT modify, adapt, or create derivative works based on this Software
-- You may NOT distribute, sublicense, or sell copies of this Software
-- You may NOT reverse engineer, decompile, or disassemble this Software
-- This Software is provided "as is" without warranty of any kind
-
-For licensing inquiries, please contact the copyright owner.
 
 ## Acknowledgments
 
@@ -302,4 +280,4 @@ For licensing inquiries, please contact the copyright owner.
 
 ## Contact
 
-GitHub: https://github.com/matthew-fornear/pan
+contact@omnidata-solutions.com

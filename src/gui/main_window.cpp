@@ -147,6 +147,8 @@ MainWindow::MainWindow()
     , isDraggingPlayhead_(false)
     , dragStartBeat_(0.0f)
     , playbackSamplePosition_(0)
+    , recordingSampleOffset_(0)
+    , lastRecordPlaybackPos_(-1)
     , selectedTrackIndex_(0)
     , currentProjectPath_("")
     , hasUnsavedChanges_(false)
@@ -876,31 +878,25 @@ bool MainWindow::initializeMIDI() {
                         
                         // If master record is active and playing, record to timeline
                         if (masterRecord_ && isPlaying_) {
+                            double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                            float beatsPerSecond = bpm_ / 60.0f;
+                            int64_t loopStartSamples = static_cast<int64_t>((loopStartBeat_ / beatsPerSecond) * sampleRate);
+                            int64_t loopLenSamples = static_cast<int64_t>((loopLengthBeats_ / beatsPerSecond) * sampleRate);
+                            
                             if (!track.recordingClip) {
-                                double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
-                                float beatsPerSecond = bpm_ / 60.0f;
-                                float currentTimelinePos;
-                                {
-                                    std::lock_guard<std::mutex> lock(timelineMutex_);
-                                    currentTimelinePos = timelinePosition_;
-                                }
-                                int64_t clipStartSample = static_cast<int64_t>(currentTimelinePos / beatsPerSecond * sampleRate);
+                                int64_t clipStartSample = loopEnabled_ ? loopStartSamples : playbackSamplePosition_;
                                 track.recordingClip = std::make_shared<MidiClip>("Recording");
                                 track.recordingClip->setStartTime(clipStartSample);
                             }
                             
-                            // Get timeline position thread-safely
-                            float currentTimelinePos;
-                            {
-                                std::lock_guard<std::mutex> lock(timelineMutex_);
-                                currentTimelinePos = timelinePosition_;
+                            int64_t currentSampleAbs;
+                            if (loopEnabled_) {
+                                int64_t rel = playbackSamplePosition_ - loopStartSamples;
+                                if (rel < 0) rel = 0;
+                                currentSampleAbs = loopStartSamples + (loopLenSamples > 0 ? (rel % loopLenSamples) : rel);
+                            } else {
+                                currentSampleAbs = playbackSamplePosition_;
                             }
-                            
-                            // Convert timeline position (beats) to samples relative to clip start
-                            // Timeline position is in beats, we need samples from clip start (0)
-                            double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
-                            float beatsPerSecond = bpm_ / 60.0f;
-                            int64_t currentSampleAbs = static_cast<int64_t>(currentTimelinePos / beatsPerSecond * sampleRate);
                             int64_t currentSample = currentSampleAbs - track.recordingClip->getStartTime();
                             
                             // Add event to recording clip (timestamp is relative to clip start)
@@ -910,7 +906,7 @@ bool MainWindow::initializeMIDI() {
                             static int eventCount = 0;
                             if (++eventCount % 10 == 0) {  // Print every 10th event to avoid spam
                                 std::cout << "Recorded MIDI event: track=" << trackIdx 
-                                          << ", beat=" << currentTimelinePos 
+                                          << ", sampleAbs=" << currentSampleAbs
                                           << ", sample=" << currentSample 
                                           << ", clipEvents=" << track.recordingClip->getEvents().size() << std::endl;
                             }
@@ -1203,10 +1199,107 @@ void MainWindow::renderUI() {
         }
     }
     
+    // Helper: finalize any ongoing recording clips into track clip lists
+    auto finalizeRecordingClips = [&]() {
+        lastRecordedTrack_ = static_cast<size_t>(-1);
+        lastRecordedClip_ = static_cast<size_t>(-1);
+        bool added = false;
+        for (size_t ti = 0; ti < tracks_.size(); ++ti) {
+            auto& t = tracks_[ti];
+            if (t.recordingClip) {
+                t.clips.push_back(t.recordingClip);
+                lastRecordedTrack_ = ti;
+                lastRecordedClip_ = t.clips.size() - 1;
+                t.recordingClip.reset();
+                added = true;
+            }
+        }
+        if (added) markDirty();
+    };
+    
     // Handle Spacebar for play/pause
     if (ImGui::IsKeyPressed(ImGuiKey_Space) && !ImGui::GetIO().WantTextInput) {
+        bool wasPlaying = isPlaying_;
         isPlaying_ = !isPlaying_;
         isCountingIn_ = false;  // Cancel count-in if active
+        
+        if (!isPlaying_) {
+            // Reset tracking when stopping
+            lastRecordPlaybackPos_ = -1;
+            recordingSampleOffset_ = 0;
+        } else {
+            lastRecordPlaybackPos_ = playbackSamplePosition_;
+        }
+        
+        // If we just stopped while recording, commit the clip so it shows/plays
+        if (wasPlaying && !isPlaying_ && masterRecord_) {
+            finalizeRecordingClips();
+        }
+    }
+    
+    // Clip copy/paste (Ctrl+C / Ctrl+V) and undo/delete
+    auto cloneClipRelative = [&](std::shared_ptr<MidiClip> src) -> std::shared_ptr<MidiClip> {
+        if (!src) return nullptr;
+        auto dst = std::make_shared<MidiClip>(src->getName());
+        int64_t offset = src->getStartTime();
+        for (const auto& ev : src->getEvents()) {
+            dst->addEvent(ev.timestamp - offset, ev.message);
+        }
+        dst->setStartTime(0);
+        return dst;
+    };
+    
+    if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C) && !ImGui::GetIO().WantTextInput) {
+        if (selectedClipTrack_ < tracks_.size() && selectedClipIndex_ < tracks_[selectedClipTrack_].clips.size()) {
+            clipboardClip_ = cloneClipRelative(tracks_[selectedClipTrack_].clips[selectedClipIndex_]);
+        }
+    }
+    if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V) && !ImGui::GetIO().WantTextInput) {
+        if (clipboardClip_ && selectedTrackIndex_ < tracks_.size()) {
+            double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+            float beatsPerSecond = bpm_ / 60.0f;
+            float targetBeat;
+            {
+                std::lock_guard<std::mutex> lock(timelineMutex_);
+                targetBeat = timelinePosition_;
+            }
+            float grid = std::max(0.0625f, timelineDivisionBeats_);
+            if (gridSnapEnabled_) targetBeat = std::round(targetBeat / grid) * grid;
+            int64_t targetStart = static_cast<int64_t>(targetBeat / beatsPerSecond * sampleRate);
+            
+            auto pasted = cloneClipRelative(clipboardClip_);
+            if (pasted) {
+                pasted->setStartTime(targetStart);
+                tracks_[selectedTrackIndex_].clips.push_back(pasted);
+                selectedClipTrack_ = selectedTrackIndex_;
+                selectedClipIndex_ = tracks_[selectedTrackIndex_].clips.size() - 1;
+                markDirty();
+            }
+        }
+    }
+    // Ctrl+Z: undo last recorded clip (single-level)
+    if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z) && !ImGui::GetIO().WantTextInput) {
+        if (lastRecordedTrack_ < tracks_.size()) {
+            auto& t = tracks_[lastRecordedTrack_];
+            if (lastRecordedClip_ < t.clips.size()) {
+                t.clips.erase(t.clips.begin() + lastRecordedClip_);
+                selectedClipTrack_ = static_cast<size_t>(-1);
+                selectedClipIndex_ = static_cast<size_t>(-1);
+                markDirty();
+            }
+            lastRecordedTrack_ = static_cast<size_t>(-1);
+            lastRecordedClip_ = static_cast<size_t>(-1);
+        }
+    }
+    // Delete key: remove selected clip
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !ImGui::GetIO().WantTextInput) {
+        if (selectedClipTrack_ < tracks_.size() && selectedClipIndex_ < tracks_[selectedClipTrack_].clips.size()) {
+            auto& t = tracks_[selectedClipTrack_];
+            t.clips.erase(t.clips.begin() + selectedClipIndex_);
+            selectedClipTrack_ = static_cast<size_t>(-1);
+            selectedClipIndex_ = static_cast<size_t>(-1);
+            markDirty();
+        }
     }
     
     // Handle F9: arm record + play
@@ -5758,13 +5851,31 @@ void MainWindow::renderTransportControls() {
     
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     
+    // Helper to finalize any active recording clips
+    auto finalizeRecordingClips = [&]() {
+        lastRecordedTrack_ = static_cast<size_t>(-1);
+        lastRecordedClip_ = static_cast<size_t>(-1);
+        bool added = false;
+        for (size_t ti = 0; ti < tracks_.size(); ++ti) {
+            auto& t = tracks_[ti];
+            if (t.recordingClip) {
+                t.clips.push_back(t.recordingClip);
+                lastRecordedTrack_ = ti;
+                lastRecordedClip_ = t.clips.size() - 1;
+                t.recordingClip.reset();
+                added = true;
+            }
+        }
+        if (added) markDirty();
+    };
+    
     // Play button
     ImVec2 playButtonPos = ImGui::GetCursorScreenPos();
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.2f, 0.2f, 0.5f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.3f, 0.3f, 0.3f, 0.5f));
     
-            if (ImGui::Button("##play", ImVec2(40, 40))) {
+    if (ImGui::Button("##play", ImVec2(40, 40))) {
         // Check if count-in is enabled and we're recording
         if (countInEnabled_ && masterRecord_) {
             // Start count-in
@@ -5914,9 +6025,11 @@ void MainWindow::renderTransportControls() {
     bool stopButtonClicked = ImGui::Button("##stop", ImVec2(40, 40));
     bool stopButtonDoubleClicked = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0);
     
-    if (stopButtonClicked) {
+        if (stopButtonClicked) {
         isPlaying_ = false;
         isCountingIn_ = false;  // Cancel count-in if active
+        lastRecordPlaybackPos_ = -1;
+        recordingSampleOffset_ = 0;
         
         // Stop all notes on all tracks
         for (auto& track : tracks_) {
@@ -5931,12 +6044,7 @@ void MainWindow::renderTransportControls() {
         
         // Finalize recording clips when stopped
         if (masterRecord_) {
-            for (auto& track : tracks_) {
-                if (track.recordingClip) {
-                    track.clips.push_back(track.recordingClip);
-                    track.recordingClip.reset();
-                }
-            }
+            finalizeRecordingClips();
         }
     }
     
@@ -6157,9 +6265,10 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
     canvasSize.x = std::max(canvasSize.x, 600.0f);
     canvasSize.y = timelineHeight;
     
-    // Horizontal timeline scroll bar (controls all tracks) - only draw once above Track 1
+    // Reserve space for horizontal scroll bar for all tracks; render only on track 0
+    float barHeight = 18.0f;
+    float barPad = 4.0f;
     if (trackIndex == 0) {
-        float barHeight = 18.0f;
         // Compute max content length in beats (clips/loop)
         float maxBeat = loopStartBeat_ + loopLengthBeats_;
         double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
@@ -6192,10 +6301,10 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
         }
         ImGui::PopStyleVar(2);
         ImGui::PopID();
-        
-        canvasPos.y += barHeight + 4.0f; // extra padding below scrollbar
-        canvasSize.y -= (barHeight + 4.0f);
     }
+    // Apply reserved space for all tracks to keep alignment
+    canvasPos.y += barHeight + barPad + 6.0f; // extra dead space to align tracks
+    canvasSize.y -= (barHeight + barPad + 6.0f);
     
     int trackColorIdx = tracks_[trackIndex].colorIndex % 24;
     
@@ -6203,11 +6312,10 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
     drawList->AddRectFilled(canvasPos, ImVec2(canvasPos.x + canvasSize.x, canvasPos.y + canvasSize.y),
                            IM_COL32(22, 22, 22, 255));
     
-    // Beat marker area (top)
+    // Beat marker area (top) and numeration only on track 0
     drawList->AddRectFilled(canvasPos, ImVec2(canvasPos.x + canvasSize.x, canvasPos.y + beatMarkerHeight),
                            IM_COL32(30, 30, 30, 255));
     
-    // Draw beat markers with configurable division
     float gridStep = std::max(0.0625f, timelineDivisionBeats_);
     float visibleBeats = canvasSize.x / pixelsPerBeat;
     float startBeat = std::floor(timelineScrollX_ / pixelsPerBeat);
@@ -6225,8 +6333,7 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
             drawList->AddLine(ImVec2(x, canvasPos.y + beatMarkerHeight),
                              ImVec2(x, canvasPos.y + canvasSize.y), lineColor);
             
-            // Bar/beat labels in music-theory style: Bar.Beat
-            if (isMajor) {
+            if (trackIndex == 0 && isMajor) {
                 int barNum = beatInt / 4 + 1;
                 int beatInBar = (beatInt % 4) + 1;
                 char beatLabel[16];
@@ -6250,7 +6357,7 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
     float beatsPerSecond = bpm_ / 60.0f;
     float samplesPerBeat = sampleRate / beatsPerSecond;
     
-    // Draw all clips (both recording and completed)
+    // Draw all clips (both recording and completed) with clip bars
     std::vector<std::shared_ptr<MidiClip>> clipsToDraw = track.clips;
     if (track.recordingClip) {
         clipsToDraw.push_back(track.recordingClip);
@@ -6268,6 +6375,244 @@ void MainWindow::renderTrackTimeline(size_t trackIndex) {
         for (size_t i = 0; i < track.clips.size(); ++i) {
             std::cout << "  Clip " << i << " has " << track.clips[i]->getEvents().size() << " events" << std::endl;
         }
+    }
+    
+    // Build clip rectangles for interaction
+    struct ClipRect {
+        size_t clipIndex;
+        bool isRecording;
+        float startBeat;
+        float endBeat;
+    };
+    std::vector<ClipRect> clipRects;
+    
+    auto snapTimeline = [&](float beat) {
+        float grid = std::max(0.0625f, timelineDivisionBeats_);
+        return gridSnapEnabled_ ? std::round(beat / grid) * grid : beat;
+    };
+    
+    size_t baseClipCount = track.clips.size();
+    for (size_t i = 0; i < clipsToDraw.size(); ++i) {
+        auto& clip = clipsToDraw[i];
+        if (!clip) continue;
+        const auto& events = clip->getEvents();
+        float clipStartBeat = static_cast<float>(clip->getStartTime()) / samplesPerBeat;
+        float clipEndBeat = clipStartBeat + 1.0f; // minimum length
+        for (const auto& ev : events) {
+            float evBeat = static_cast<float>(ev.timestamp) / samplesPerBeat + clipStartBeat;
+            clipEndBeat = std::max(clipEndBeat, evBeat);
+        }
+        clipRects.push_back({i, i >= baseClipCount, clipStartBeat, clipEndBeat});
+    }
+    
+    auto cloneClipRelative = [&](std::shared_ptr<MidiClip> src) -> std::shared_ptr<MidiClip> {
+        if (!src) return nullptr;
+        auto dst = std::make_shared<MidiClip>(src->getName());
+        int64_t offset = src->getStartTime();
+        for (const auto& ev : src->getEvents()) {
+            dst->addEvent(ev.timestamp - offset, ev.message);
+        }
+        dst->setStartTime(0);
+        return dst;
+    };
+    
+    // Clip interaction state (static per UI)
+    struct ClipDragState {
+        bool dragging = false;
+        bool resizeLeft = false;
+        bool resizeRight = false;
+        size_t trackIndex = static_cast<size_t>(-1);
+        size_t clipIndex = static_cast<size_t>(-1);
+        float grabOffsetBeat = 0.0f;
+        float originalLength = 0.0f;
+    };
+    static ClipDragState clipDrag;
+    
+    // Render clips as bars above notes
+    float clipLaneY = canvasPos.y + beatMarkerHeight;
+    float clipLaneH = canvasSize.y - beatMarkerHeight - 2.0f;
+    
+    for (const auto& cr : clipRects) {
+        float x1 = canvasPos.x + cr.startBeat * pixelsPerBeat - timelineScrollX_;
+        float x2 = canvasPos.x + cr.endBeat * pixelsPerBeat - timelineScrollX_;
+        if (x2 < canvasPos.x || x1 > canvasPos.x + canvasSize.x) continue;
+        
+        float y1 = clipLaneY;
+        float y2 = clipLaneY + clipLaneH;
+        ImU32 clipColor = cr.isRecording ? IM_COL32(255, 170, 0, 140) : IM_COL32(120, 120, 120, 180);
+        ImU32 border = IM_COL32(200, 200, 200, 200);
+        bool isSelected = (selectedClipTrack_ == trackIndex && selectedClipIndex_ == cr.clipIndex);
+        if (isSelected) clipColor = IM_COL32(180, 140, 60, 200);
+        
+        drawList->AddRectFilled(ImVec2(x1, y1), ImVec2(x2, y2), clipColor, 0.0f);
+        drawList->AddRect(ImVec2(x1, y1), ImVec2(x2, y2), border, 0.0f);
+        
+        // Edge handles
+        float edgeW = 8.0f;
+        ImVec2 leftMin(x1, y1);
+        ImVec2 leftMax(x1 + edgeW, y2);
+        ImVec2 rightMin(x2 - edgeW, y1);
+        ImVec2 rightMax(x2, y2);
+        
+        // Left resize
+        ImGui::PushID(static_cast<int>(trackIndex * 1000 + cr.clipIndex * 3 + 0));
+        ImGui::SetCursorScreenPos(leftMin);
+        ImGui::InvisibleButton("##clip_left", ImVec2(edgeW, clipLaneH));
+        bool leftActive = ImGui::IsItemActive() && ImGui::IsMouseDragging(0);
+        bool leftClicked = ImGui::IsItemHovered() && ImGui::IsMouseClicked(0);
+        ImGui::PopID();
+        
+        // Right resize
+        ImGui::PushID(static_cast<int>(trackIndex * 1000 + cr.clipIndex * 3 + 1));
+        ImGui::SetCursorScreenPos(rightMin);
+        ImGui::InvisibleButton("##clip_right", ImVec2(edgeW, clipLaneH));
+        bool rightActive = ImGui::IsItemActive() && ImGui::IsMouseDragging(0);
+        bool rightClicked = ImGui::IsItemHovered() && ImGui::IsMouseClicked(0);
+        ImGui::PopID();
+        
+        // Body drag
+        ImGui::PushID(static_cast<int>(trackIndex * 1000 + cr.clipIndex * 3 + 2));
+        ImGui::SetCursorScreenPos(ImVec2(leftMax.x, y1));
+        ImGui::InvisibleButton("##clip_body", ImVec2(std::max(4.0f, (x2 - x1) - 2 * edgeW), clipLaneH));
+        bool bodyActive = ImGui::IsItemActive() && ImGui::IsMouseDragging(0);
+        bool bodyClicked = ImGui::IsItemHovered() && ImGui::IsMouseClicked(0);
+        ImGui::PopID();
+        
+        if (leftClicked || rightClicked || bodyClicked) {
+            selectedClipTrack_ = trackIndex;
+            selectedClipIndex_ = cr.clipIndex;
+        }
+        
+        if (ImGui::BeginPopupContextItem("clip_ctx")) {
+            if (ImGui::MenuItem("Copy")) {
+                clipboardClip_ = cloneClipRelative(cr.clipIndex < track.clips.size() ? track.clips[cr.clipIndex] : nullptr);
+            }
+            if (ImGui::MenuItem("Paste", nullptr, false, clipboardClip_ != nullptr)) {
+                if (clipboardClip_) {
+                    double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                    float beatsPerSecond = bpm_ / 60.0f;
+                    float targetBeat;
+                    {
+                        std::lock_guard<std::mutex> lock(timelineMutex_);
+                        targetBeat = timelinePosition_;
+                    }
+                    float grid = std::max(0.0625f, timelineDivisionBeats_);
+                    if (gridSnapEnabled_) targetBeat = std::round(targetBeat / grid) * grid;
+                    int64_t targetStart = static_cast<int64_t>(targetBeat / beatsPerSecond * sampleRate);
+                    auto pasted = cloneClipRelative(clipboardClip_);
+                    if (pasted) {
+                        pasted->setStartTime(targetStart);
+                        track.clips.push_back(pasted);
+                        selectedClipTrack_ = trackIndex;
+                        selectedClipIndex_ = track.clips.size() - 1;
+                        markDirty();
+                    }
+                }
+            }
+            if (ImGui::MenuItem("Delete")) {
+                if (cr.clipIndex < track.clips.size()) {
+                    track.clips.erase(track.clips.begin() + cr.clipIndex);
+                    selectedClipTrack_ = static_cast<size_t>(-1);
+                    selectedClipIndex_ = static_cast<size_t>(-1);
+                    markDirty();
+                }
+            }
+            ImGui::Separator();
+            bool snap = clipSnapEnabled_;
+            if (ImGui::MenuItem("Clip Snap", nullptr, snap)) {
+                clipSnapEnabled_ = !clipSnapEnabled_;
+            }
+            const struct { const char* label; float beats; } clipDivs[] = {
+                { "1 Bar", 4.0f },
+                { "1/2 Bar", 2.0f },
+                { "1 Beat", 1.0f },
+                { "1/2 Beat", 0.5f },
+                { "1/4 Beat", 0.25f },
+                { "1/8 Beat", 0.125f },
+                { "1/16 Beat", 0.0625f },
+            };
+            for (const auto& d : clipDivs) {
+                bool sel = std::abs(clipSnapBeats_ - d.beats) < 1e-5f;
+                if (ImGui::MenuItem(d.label, nullptr, sel)) {
+                    clipSnapBeats_ = d.beats;
+                }
+            }
+            ImGui::EndPopup();
+        }
+        
+        if (leftClicked) {
+            clipDrag = {false, true, false, trackIndex, cr.clipIndex, 0.0f, cr.endBeat - cr.startBeat};
+        } else if (rightClicked) {
+            clipDrag = {false, false, true, trackIndex, cr.clipIndex, 0.0f, cr.endBeat - cr.startBeat};
+        } else if (bodyClicked) {
+            float mouseBeat = (ImGui::GetMousePos().x - canvasPos.x + timelineScrollX_) / pixelsPerBeat;
+            clipDrag = {true, false, false, trackIndex, cr.clipIndex, mouseBeat - cr.startBeat, cr.endBeat - cr.startBeat};
+        }
+        
+        if ((leftActive || rightActive || bodyActive) && clipDrag.clipIndex == cr.clipIndex && clipDrag.trackIndex == trackIndex) {
+            float mouseBeat = (ImGui::GetMousePos().x - canvasPos.x + timelineScrollX_) / pixelsPerBeat;
+            float grid = std::max(0.0625f, clipSnapBeats_);
+            if (clipSnapEnabled_) mouseBeat = std::round(mouseBeat / grid) * grid;
+            
+            if (clipDrag.resizeLeft) {
+                float newStart = std::min(mouseBeat, cr.endBeat - 0.25f);
+                if (cr.clipIndex < track.clips.size()) {
+                    auto& clip = track.clips[cr.clipIndex];
+                    if (clip) {
+                        clip->setStartTime(static_cast<int64_t>(newStart * samplesPerBeat));
+                    }
+                }
+            } else if (clipDrag.resizeRight) {
+                float newEnd = std::max(mouseBeat, cr.startBeat + 0.25f);
+                // Not truncating events; visual length updates via events when added.
+                (void)newEnd;
+            } else if (clipDrag.dragging) {
+                float newStartBeat = mouseBeat - clipDrag.grabOffsetBeat;
+                if (gridSnapEnabled_) newStartBeat = snapTimeline(newStartBeat);
+                if (cr.clipIndex < track.clips.size()) {
+                    auto& clip = track.clips[cr.clipIndex];
+                    if (clip) {
+                        int64_t newStartSamples = static_cast<int64_t>(std::max(0.0f, newStartBeat) * samplesPerBeat);
+                        clip->setStartTime(newStartSamples);
+                    }
+                }
+            }
+            markDirty();
+        }
+    }
+    
+    if (!ImGui::IsMouseDown(0)) {
+        clipDrag = {};
+    }
+    
+    // Timeline empty-area context for paste (at playhead)
+    if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(1) && !ImGui::IsAnyItemHovered()) {
+        ImGui::OpenPopup("timeline_ctx_menu");
+    }
+    if (ImGui::BeginPopup("timeline_ctx_menu")) {
+        if (ImGui::MenuItem("Paste", nullptr, false, clipboardClip_ != nullptr)) {
+            if (clipboardClip_ && selectedTrackIndex_ < tracks_.size()) {
+                double sampleRate = engine_ ? engine_->getSampleRate() : 44100.0;
+                float beatsPerSecond = bpm_ / 60.0f;
+                float targetBeat;
+                {
+                    std::lock_guard<std::mutex> lock(timelineMutex_);
+                    targetBeat = timelinePosition_;
+                }
+                float grid = std::max(0.0625f, clipSnapBeats_);
+                if (clipSnapEnabled_) targetBeat = std::round(targetBeat / grid) * grid;
+                int64_t targetStart = static_cast<int64_t>(targetBeat / beatsPerSecond * sampleRate);
+                auto pasted = cloneClipRelative(clipboardClip_);
+                if (pasted) {
+                    pasted->setStartTime(targetStart);
+                    tracks_[selectedTrackIndex_].clips.push_back(pasted);
+                    selectedClipTrack_ = selectedTrackIndex_;
+                    selectedClipIndex_ = tracks_[selectedTrackIndex_].clips.size() - 1;
+                    markDirty();
+                }
+            }
+        }
+        ImGui::EndPopup();
     }
     
     // Build note list: all note-on/note-off pairs
@@ -7177,6 +7522,13 @@ void MainWindow::renderPianoRoll() {
     }
     
     // Handle note dragging and interaction
+    struct NoteResizeInfo {
+        size_t clipIndex;
+        size_t eventIndex;
+        float originalStartBeat;
+        float originalEndBeat;
+    };
+    static std::vector<NoteResizeInfo> resizeGroup;
     ImVec2 mousePos = ImGui::GetMousePos();
     bool mouseOverCanvas = (mousePos.x >= gridStart && mousePos.x < gridStart + gridWidth &&
                            mousePos.y >= canvasPos.y && mousePos.y < canvasPos.y + canvasSize.y);
@@ -7236,6 +7588,25 @@ void MainWindow::renderPianoRoll() {
             resizingNote_.originalStartBeat = noteRects[hoveredNoteIdx].startBeat;
             resizingNote_.originalEndBeat = noteRects[hoveredNoteIdx].endBeat;
             resizingNote_.noteNum = noteRects[hoveredNoteIdx].noteNum;
+            
+            // Build resize group from current selection (or just the hovered note if none selected)
+            resizeGroup.clear();
+            auto addResizeInfo = [&](size_t clipIdx, size_t evtIdx) {
+                for (const auto& nr : noteRects) {
+                    if (nr.clipIndex == clipIdx && nr.eventIndex == evtIdx) {
+                        resizeGroup.push_back({clipIdx, evtIdx, nr.startBeat, nr.endBeat});
+                        return;
+                    }
+                }
+            };
+            if (!selectedNotes_.empty()) {
+                for (const auto& sel : selectedNotes_) {
+                    addResizeInfo(sel.first, sel.second);
+                }
+            } else {
+                // If nothing selected, resize only the hovered note
+                addResizeInfo(resizingNote_.clipIndex, resizingNote_.eventIndex);
+            }
         } else if (hoveredNoteIdx >= 0) {
             // Check if clicked note is already in selection
             std::pair<size_t, size_t> clickedNote = {noteRects[hoveredNoteIdx].clipIndex, noteRects[hoveredNoteIdx].eventIndex};
@@ -7580,42 +7951,48 @@ void MainWindow::renderPianoRoll() {
                     currentBeat = snapToGrid(currentBeat);
                 }
                 
-                // Update the note length
-                if (resizingNote_.clipIndex < track.clips.size()) {
-                    auto& clip = track.clips[resizingNote_.clipIndex];
+                // Update length for all selected notes in the resize group
+                const float minDur = snapToGrid(0.25f);
+                float deltaStart = 0.0f;
+                float deltaEnd = 0.0f;
+                if (resizingNote_.isLeftEdge) {
+                    float newStartBeat = std::min(currentBeat, resizingNote_.originalEndBeat - minDur);
+                    deltaStart = newStartBeat - resizingNote_.originalStartBeat;
+                } else {
+                    float newEndBeat = std::max(currentBeat, resizingNote_.originalStartBeat + minDur);
+                    deltaEnd = newEndBeat - resizingNote_.originalEndBeat;
+                }
+                
+                for (const auto& info : resizeGroup) {
+                    if (info.clipIndex >= track.clips.size()) continue;
+                    auto& clip = track.clips[info.clipIndex];
                     auto& events = const_cast<std::vector<MidiClip::MidiEvent>&>(clip->getEvents());
+                    if (info.eventIndex >= events.size() || !events[info.eventIndex].message.isNoteOn()) continue;
                     
-                    if (resizingNote_.eventIndex < events.size() && events[resizingNote_.eventIndex].message.isNoteOn()) {
-                        auto& noteOnEvent = events[resizingNote_.eventIndex];
-                        float clipStartBeat = static_cast<float>(clip->getStartTime()) / samplesPerBeat;
-                        
-                        float newStartBeat = resizingNote_.originalStartBeat;
-                        float newEndBeat = resizingNote_.originalEndBeat;
-                        
-                        if (resizingNote_.isLeftEdge) {
-                            // Resize from left edge (move start time)
-                            newStartBeat = std::min(currentBeat, resizingNote_.originalEndBeat - snapToGrid(0.25f));
-                            
-                            int64_t newTimestamp = static_cast<int64_t>((newStartBeat - clipStartBeat) * samplesPerBeat);
-                            noteOnEvent.timestamp = std::max(static_cast<int64_t>(0), newTimestamp);
-                        } else {
-                            // Resize from right edge (move end time)
-                            newEndBeat = std::max(currentBeat, resizingNote_.originalStartBeat + snapToGrid(0.25f));
-                            
-                            // Find and update note-off
-                            uint8_t noteNum = noteOnEvent.message.getNoteNumber();
-                            for (size_t i = resizingNote_.eventIndex + 1; i < events.size(); ++i) {
-                                if (events[i].message.isNoteOff() && events[i].message.getNoteNumber() == noteNum) {
-                                    int64_t newOffTimestamp = static_cast<int64_t>((newEndBeat - clipStartBeat) * samplesPerBeat);
-                                    events[i].timestamp = std::max(static_cast<int64_t>(0), newOffTimestamp);
-                                    break;
-                                }
+                    float clipStartBeat = static_cast<float>(clip->getStartTime()) / samplesPerBeat;
+                    float origStart = info.originalStartBeat;
+                    float origEnd = info.originalEndBeat;
+                    float origDur = origEnd - origStart;
+                    
+                    if (resizingNote_.isLeftEdge) {
+                        float newStartBeat = std::min(origStart + deltaStart, origEnd - minDur);
+                        int64_t newTimestamp = static_cast<int64_t>((newStartBeat - clipStartBeat) * samplesPerBeat);
+                        events[info.eventIndex].timestamp = std::max<int64_t>(0, newTimestamp);
+                        // Note-off stays put so duration shrinks/grows accordingly
+                    } else {
+                        float newDur = std::max(minDur, origDur + deltaEnd);
+                        uint8_t noteNum = events[info.eventIndex].message.getNoteNumber();
+                        int64_t newOffTimestamp = static_cast<int64_t>((origStart + newDur - clipStartBeat) * samplesPerBeat);
+                        for (size_t i = info.eventIndex + 1; i < events.size(); ++i) {
+                            if (events[i].message.isNoteOff() && events[i].message.getNoteNumber() == noteNum) {
+                                events[i].timestamp = std::max<int64_t>(0, newOffTimestamp);
+                                break;
                             }
                         }
-                        
-                        markDirty();
                     }
                 }
+                
+                markDirty();
             }
         } else if (ImGui::IsMouseReleased(0)) {
             resizingNote_.isResizing = false;
@@ -8913,11 +9290,13 @@ void MainWindow::initializeInstrumentPresets() {
     // Warped Rhodes - Processed electric piano with tape wobble character
     {
         InstrumentEnvelope envWarped;
-        envWarped.ampEnvelope = ADSREnvelope(0.005f, 1.8f, 0.35f, 1.2f);
-        envWarped.lfo1 = LFO(0.4f, 0.08f, LFO::Target::Pitch);  // Subtle warble
+        // Longer, softer fade to kill clicks
+        envWarped.ampEnvelope = ADSREnvelope(0.03f, 1.8f, 0.40f, 1.6f);
+        envWarped.lfo1 = LFO(0.35f, 0.05f, LFO::Target::Pitch);  // More subtle warble
         envWarped.filter.enabled = true;
         envWarped.filter.cutoff = 0.5f;
-        envWarped.filter.resonance = 0.15f;
+        envWarped.filter.resonance = 0.1f;
+        envWarped.saturation.enabled = false; // keep clean to avoid transient grit
         instrumentPresets_.push_back(InstrumentPreset(
             "Warped Rhodes",
             "Keys",
