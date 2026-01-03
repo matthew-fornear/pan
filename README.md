@@ -1,6 +1,6 @@
 # Pan - Digital Audio Workstation
 
-Pan is a modern, open-source Digital Audio Workstation (DAW) designed for music production, audio editing, and sound design.
+Pan is a modern Digital Audio Workstation (DAW) designed for music production, audio editing, and sound design.
 
 GitHub: https://github.com/matthew-fornear/pan
 
@@ -271,17 +271,26 @@ Then restart your audio session or reboot.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+This is a proprietary project. Unauthorized copying, modification, distribution, or use of this software, via any medium, is strictly prohibited without explicit written permission from the copyright owner.
 
 ## License
 
-[Specify your license here]
+Copyright (c) 2024 Matthew Fornear. All Rights Reserved.
+
+This software and associated documentation files (the "Software") are the proprietary and confidential property of Matthew Fornear. 
+
+**Unauthorized use, copying, modification, distribution, or reproduction of this Software, in whole or in part, is strictly prohibited and may result in severe civil and criminal penalties.**
+
+The Software is protected by copyright laws and international copyright treaties, as well as other intellectual property laws and treaties. Any unauthorized use of the Software may violate copyright, trademark, and other laws.
+
+**Terms:**
+- You may NOT fork, clone, copy, or reproduce this repository without explicit written permission
+- You may NOT modify, adapt, or create derivative works based on this Software
+- You may NOT distribute, sublicense, or sell copies of this Software
+- You may NOT reverse engineer, decompile, or disassemble this Software
+- This Software is provided "as is" without warranty of any kind
+
+For licensing inquiries, please contact the copyright owner.
 
 ## Acknowledgments
 
